@@ -396,19 +396,24 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 		}
 	} else if len(masterNodes) == 1 && len(slaveNodes) > 0 {
 		realMaster = masterNodes[0]
-		currentRealMaster := k8sutils.GetRedisReplicationRealMaster(ctx, r.K8sClient, instance, masterNodes)
 
-		if currentRealMaster == "" && !instance.EnableSentinel() {
-			log.FromContext(ctx).Info("Detected disconnected slaves, reconfiguring replication",
+		// Continuously ENFORCE replication: re-point every replica at the single master on
+		// every reconcile. SLAVEOF to the current master is idempotent (a no-op for a replica
+		// already attached to it), so this is safe to run each cycle and repairs a replica that
+		// has drifted off a LIVE master — e.g. one left `replicaof <recycled-IP>` (link down)
+		// after a master reschedule, or `replicaof <self>` after a botched re-stitch.
+		//
+		// The previous guard (`currentRealMaster == "" && !instance.EnableSentinel()`) only
+		// re-stitched when the master had ZERO attached slaves AND sentinel was disabled. In the
+		// common deployment here sentinel is ENABLED and at least one replica is usually still
+		// attached, so a single drifted replica fell through untouched forever: this reconcile
+		// skipped it, and Sentinel only reconfigures replicas during a master FAILOVER (sdown/
+		// odown) — it never heals a replica that wandered off a master that is still up. Net was a
+		// churn-proportional ghost-master that self-healed through neither layer. (gitea iac #1135)
+		if err := k8sutils.CreateMasterSlaveReplication(ctx, r.K8sClient, instance, slaveNodes, realMaster); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to enforce master-slave replication",
 				"master", realMaster, "slaves", slaveNodes)
-
-			allPods := append(masterNodes, slaveNodes...)
-			if err := k8sutils.CreateMasterSlaveReplication(ctx, r.K8sClient, instance, allPods, realMaster); err != nil {
-				log.FromContext(ctx).Error(err, "Failed to reconfigure master-slave replication",
-					"master", realMaster, "slaves", slaveNodes)
-				return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
-			}
-			log.FromContext(ctx).Info("Successfully reconfigured slave replication")
+			return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
 		}
 	} else if len(masterNodes) == 0 && len(slaveNodes) > 0 {
 		// No pod reports role:master but replicas exist: the replication set has
