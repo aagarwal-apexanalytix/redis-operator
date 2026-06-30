@@ -461,25 +461,35 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 			return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
 		}
 	} else if len(masterNodes) == 1 && len(slaveNodes) > 0 {
-		currentRealMaster := r.redisReplicationRealMaster(ctx, instance, masterNodes)
+		realMaster = masterNodes[0]
 
-		if currentRealMaster == "" && !instance.EnableSentinel() {
-			log.FromContext(ctx).Info("Detected disconnected slaves, reconfiguring replication",
+		// Continuously ENFORCE replication: re-point every replica at the single master on
+		// every reconcile. SLAVEOF to the current master is idempotent (a no-op for a replica
+		// already attached to it), so this is safe to run each cycle and repairs a replica that
+		// has drifted off a LIVE master — e.g. one left `replicaof <recycled-IP>` (link down)
+		// after a master reschedule, or `replicaof <self>` after a botched re-stitch.
+		//
+		// Upstream's guard (`currentRealMaster == "" && !instance.EnableSentinel()`) only
+		// re-stitches when the master has ZERO attached slaves AND sentinel is disabled. In the
+		// apexanalytix deployment sentinel is ENABLED and at least one replica is usually still
+		// attached, so a single drifted replica falls through untouched forever: this reconcile
+		// skips it, and Sentinel only reconfigures replicas during a master FAILOVER (sdown/
+		// odown) — it never heals a replica that wandered off a master that is still up. Net is a
+		// churn-proportional ghost-master that self-heals through neither layer.
+		//
+		// NOTE: upstream's RepairDisconnectedNodes (#1705) does NOT cover this — it is wired into
+		// the RedisCluster controller only, not RedisReplication (our topology). (gitea iac #1135)
+		//
+		// The incompleteTopology guard is upstream's (#1720 class): never stitch from a partial
+		// view of the pods, or a mid-rollout reconcile can point replicas at a transient master.
+		if incompleteTopology {
+			log.FromContext(ctx).Info("Skipping master-slave enforcement because the observed topology is incomplete",
+				"observedPods", observedPods,
+				"expectedPods", *instance.Spec.Size)
+		} else if err := r.createRedisReplicationLink(ctx, instance, slaveNodes, realMaster); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to enforce master-slave replication",
 				"master", realMaster, "slaves", slaveNodes)
-
-			if incompleteTopology {
-				log.FromContext(ctx).Info("Skipping master-slave reconfiguration because the observed topology is incomplete",
-					"observedPods", observedPods,
-					"expectedPods", *instance.Spec.Size)
-			} else {
-				allPods := append(masterNodes, slaveNodes...)
-				if err := r.createRedisReplicationLink(ctx, instance, allPods, realMaster); err != nil {
-					log.FromContext(ctx).Error(err, "Failed to reconfigure master-slave replication",
-						"master", realMaster, "slaves", slaveNodes)
-					return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
-				}
-				log.FromContext(ctx).Info("Successfully reconfigured slave replication")
-			}
+			return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
 		}
 	}
 

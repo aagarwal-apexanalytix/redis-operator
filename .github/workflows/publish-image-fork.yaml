@@ -1,0 +1,65 @@
+name: Publish Fork Image (ghcr)
+
+# apexanalytix fork build: pushes a multi-arch operator image to the fork owner's GHCR
+# namespace using the built-in GITHUB_TOKEN (no external secrets). The upstream
+# publish-image.yaml targets ot-container-kit/quay and cannot run in a fork.
+# Trigger: push a tag matching `fqdn-*`, or run manually (workflow_dispatch).
+
+on:
+  push:
+    tags:
+      - 'fqdn-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to publish'
+        required: true
+        default: 'fqdn-enforce-dev'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-push-ghcr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tag + lowercase owner
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> "$GITHUB_ENV"
+          else
+            echo "TAG=${{ github.event.inputs.tag }}" >> "$GITHUB_ENV"
+          fi
+          echo "OWNER_LC=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Build and push image (linux/amd64,linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            IMG=${{ env.REGISTRY }}/${{ env.OWNER_LC }}/redis-operator:${{ env.TAG }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/redis-operator:${{ env.TAG }}
