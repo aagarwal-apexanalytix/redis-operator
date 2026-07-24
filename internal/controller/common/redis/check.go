@@ -19,6 +19,9 @@ type Checker interface {
 	GetMasterFromReplication(ctx context.Context, rr *rr.RedisReplication) (corev1.Pod, error)
 	GetPassword(ctx context.Context, ns string, secret *commonapi.ExistingPasswordSecret) (string, error)
 	CheckClusterSlotsAssigned(ctx context.Context, cr *rcvb2.RedisCluster) (bool, error)
+	// CheckSentinelQuorum checks if enough sentinel pods are ready to meet quorum requirements.
+	// Returns (true, readyCount, nil) if quorum is met, (false, readyCount, nil) if not enough sentinels are ready.
+	CheckSentinelQuorum(ctx context.Context, namespace, stsName string, requiredQuorum int) (bool, int, error)
 }
 
 type checker struct {
@@ -127,4 +130,51 @@ func (c *checker) CheckClusterSlotsAssigned(ctx context.Context, cr *rcvb2.Redis
 	allAssigned := clusterStatus.SlotsAssigned == 16384
 
 	return allAssigned, nil
+}
+
+// CheckSentinelQuorum checks if enough sentinel pods are ready to meet quorum requirements.
+// It counts pods that are Running and Ready (all containers ready).
+// Returns (true, readyCount, nil) if quorum is met, (false, readyCount, nil) if not.
+func (c *checker) CheckSentinelQuorum(ctx context.Context, namespace, stsName string, requiredQuorum int) (bool, int, error) {
+	sts, err := c.k8s.AppsV1().StatefulSets(namespace).Get(ctx, stsName, metav1.GetOptions{})
+	if err != nil {
+		return false, 0, err
+	}
+
+	var labels []string
+	for k, v := range sts.Spec.Selector.MatchLabels {
+		labels = append(labels, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	pods, err := c.k8s.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: strings.Join(labels, ","),
+	})
+	if err != nil {
+		return false, 0, err
+	}
+
+	readyCount := 0
+	for _, pod := range pods.Items {
+		// Skip pods that are being deleted (have a deletion timestamp)
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		// Check if all containers are ready
+		allContainersReady := true
+		for _, containerStatus := range pod.Status.ContainerStatuses {
+			if !containerStatus.Ready {
+				allContainersReady = false
+				break
+			}
+		}
+		if allContainersReady && len(pod.Status.ContainerStatuses) > 0 {
+			readyCount++
+		}
+	}
+
+	hasQuorum := readyCount >= requiredQuorum
+	return hasQuorum, readyCount, nil
 }
