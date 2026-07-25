@@ -113,11 +113,42 @@ func (r *RedisSentinelReconciler) reconcileReplication(ctx context.Context, inst
 }
 
 func (r *RedisSentinelReconciler) reconcileSentinel(ctx context.Context, instance *rsvb2.RedisSentinel) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+
 	if err := k8sutils.CreateRedisSentinel(ctx, r.K8sClient, instance, r.K8sClient, r.Client); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
 	if instance.Spec.RedisSentinelConfig == nil {
 		return intctrlutil.Reconciled()
+	}
+
+	// Check sentinel quorum before issuing sentinel commands
+	// This prevents errors when sentinel pods are down or restarting
+	requiredQuorum := 2 // default quorum
+	if instance.Spec.RedisSentinelConfig.Quorum != "" {
+		if q, err := parseQuorum(instance.Spec.RedisSentinelConfig.Quorum); err == nil {
+			if q >= 1 {
+				requiredQuorum = q
+			} else {
+				log.Info("invalid quorum value (must be >= 1), using default",
+					"configuredQuorum", q,
+					"defaultQuorum", requiredQuorum,
+				)
+			}
+		}
+	}
+
+	hasQuorum, readyCount, err := r.Checker.CheckSentinelQuorum(ctx, instance.Namespace, instance.GetStatefulSetName(), requiredQuorum)
+	if err != nil {
+		log.Error(err, "failed to check sentinel quorum")
+		return intctrlutil.RequeueAfter(ctx, time.Second*15, "failed to check sentinel quorum")
+	}
+	if !hasQuorum {
+		log.Info("sentinel quorum not met, waiting for sentinels to become ready",
+			"readyCount", readyCount,
+			"requiredQuorum", requiredQuorum,
+		)
+		return intctrlutil.RequeueAfter(ctx, time.Second*10, "sentinel quorum not met")
 	}
 
 	rr := &rrvb2.RedisReplication{}
@@ -148,6 +179,13 @@ func (r *RedisSentinelReconciler) reconcileSentinel(ctx context.Context, instanc
 		return intctrlutil.RequeueE(ctx, err, "")
 	}
 	return intctrlutil.Reconciled()
+}
+
+// parseQuorum parses the quorum string to an integer
+func parseQuorum(quorum string) (int, error) {
+	var q int
+	_, err := fmt.Sscanf(quorum, "%d", &q)
+	return q, err
 }
 
 func (r *RedisSentinelReconciler) reconcilePDB(ctx context.Context, instance *rsvb2.RedisSentinel) (ctrl.Result, error) {

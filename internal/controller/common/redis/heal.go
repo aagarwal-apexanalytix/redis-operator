@@ -105,6 +105,12 @@ func (h *healer) SentinelSet(ctx context.Context, rs *rsvb2.RedisSentinel, maste
 	if err != nil {
 		return err
 	}
+
+	// Fail if no ready sentinel pods available - don't silently succeed
+	if len(pods.Items) == 0 {
+		return fmt.Errorf("no ready sentinel pods available for SentinelSet")
+	}
+
 	sentinelPass, err := NewChecker(h.k8s).GetPassword(ctx, rs.Namespace, rs.Spec.KubernetesConfig.ExistingPasswordSecret)
 	if err != nil {
 		return err
@@ -136,6 +142,11 @@ func (h *healer) SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel) err
 		return err
 	}
 
+	// Fail if no ready sentinel pods available - don't silently succeed
+	if len(pods.Items) == 0 {
+		return fmt.Errorf("no ready sentinel pods available for SentinelReset")
+	}
+
 	sentinelPass, err := NewChecker(h.k8s).GetPassword(ctx, rs.Namespace, rs.Spec.KubernetesConfig.ExistingPasswordSecret)
 	if err != nil {
 		return err
@@ -157,6 +168,11 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 	pods, err := h.getSentinelPods(ctx, rs)
 	if err != nil {
 		return err
+	}
+
+	// Fail if no ready sentinel pods available - don't silently succeed
+	if len(pods.Items) == 0 {
+		return fmt.Errorf("no ready sentinel pods available for SentinelMonitor")
 	}
 
 	sentinelPass, err := NewChecker(h.k8s).GetPassword(ctx, rs.Namespace, rs.Spec.KubernetesConfig.ExistingPasswordSecret)
@@ -207,13 +223,46 @@ func (h *healer) getSentinelPods(ctx context.Context, rs *rsvb2.RedisSentinel) (
 	for k, v := range sentinelSTS.Spec.Selector.MatchLabels {
 		labels = append(labels, fmt.Sprintf("%s=%s", k, v))
 	}
-	pods, err := h.k8s.CoreV1().Pods(rs.Namespace).List(ctx, metav1.ListOptions{
+	allPods, err := h.k8s.CoreV1().Pods(rs.Namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: strings.Join(labels, ","),
 	})
 	if err != nil {
 		return nil, err
 	}
-	return pods, nil
+
+	// Filter to only include ready, non-terminating pods
+	readyPods := &v1.PodList{}
+	for _, pod := range allPods.Items {
+		// Skip pods being deleted
+		if pod.DeletionTimestamp != nil {
+			log.FromContext(ctx).V(1).Info("skipping terminating sentinel pod", "pod", pod.Name)
+			continue
+		}
+		// Skip pods not running
+		if pod.Status.Phase != v1.PodRunning {
+			log.FromContext(ctx).V(1).Info("skipping non-running sentinel pod", "pod", pod.Name, "phase", pod.Status.Phase)
+			continue
+		}
+		// Skip pods without IP address (not yet fully networked)
+		if pod.Status.PodIP == "" {
+			log.FromContext(ctx).V(1).Info("skipping sentinel pod without IP", "pod", pod.Name)
+			continue
+		}
+		// Check if all containers are ready
+		allContainersReady := true
+		for _, cs := range pod.Status.ContainerStatuses {
+			if !cs.Ready {
+				allContainersReady = false
+				break
+			}
+		}
+		if !allContainersReady || len(pod.Status.ContainerStatuses) == 0 {
+			log.FromContext(ctx).V(1).Info("skipping sentinel pod with unready containers", "pod", pod.Name)
+			continue
+		}
+		readyPods.Items = append(readyPods.Items, pod)
+	}
+	return readyPods, nil
 }
 
 func tlsKeyOrDefault(override, fallback string) string {
