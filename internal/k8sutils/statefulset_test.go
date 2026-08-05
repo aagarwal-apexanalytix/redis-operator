@@ -2571,3 +2571,114 @@ func TestStatefulSetSelectorLabels(t *testing.T) {
 		})
 	}
 }
+
+// Regression: a live StatefulSet carrying a VolumeClaimTemplate that the DESIRED spec no longer
+// declares (CR storage stanza removed, or the STS predates it) must not produce an update that
+// drops the VCT. VolumeClaimTemplates are immutable, so the API server rejects the whole update
+// with "Forbidden: updates to statefulset spec for fields other than ... are forbidden" — and
+// because reconcileResources surfaces that error, the ENTIRE reconcile aborts before role
+// labelling, master election and status ever run. Observed on two live tenants.
+func TestPatchStatefulSetPreservesStoredVCTWhenDesiredHasNone(t *testing.T) {
+	stored := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "valkey", Namespace: "retailpro-prod"},
+		Spec: appsv1.StatefulSetSpec{
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{ObjectMeta: metav1.ObjectMeta{Name: "valkey"}},
+			},
+		},
+	}
+	desired := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "valkey", Namespace: "retailpro-prod"},
+		Spec:       appsv1.StatefulSetSpec{}, // no VCTs — this is what the operator renders
+	}
+
+	cl := k8sClientFake.NewSimpleClientset(stored.DeepCopy())
+	err := patchStatefulSet(context.TODO(), stored, desired, "retailpro-prod", false, nil, cl)
+	assert.NoError(t, err)
+	assert.Len(t, desired.Spec.VolumeClaimTemplates, 1,
+		"stored VCT must be carried forward; dropping it makes the API server reject the entire update")
+	assert.Equal(t, "valkey", desired.Spec.VolumeClaimTemplates[0].Name)
+}
+
+// The ADD case must be left ALONE: desired declares MORE templates than the live StatefulSet.
+// Stripping them here would also orphan the /data volumeMount that getVolumeMount() puts in the pod
+// template, producing `volumeMounts[0].name: Not found` (or, on an apiserver that skips template
+// validation, an accepted spec whose rolling update deletes a pod that can never be recreated).
+func TestPatchStatefulSetLeavesVCTAloneWhenDesiredAddsThem(t *testing.T) {
+	stored := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "valkey", Namespace: "ns"},
+		Spec:       appsv1.StatefulSetSpec{}, // live STS has NO templates
+	}
+	desired := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "valkey", Namespace: "ns"},
+		Spec: appsv1.StatefulSetSpec{
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{ObjectMeta: metav1.ObjectMeta{Name: "valkey"}},
+			},
+		},
+	}
+
+	cl := k8sClientFake.NewSimpleClientset(stored.DeepCopy())
+	_ = patchStatefulSet(context.TODO(), stored, desired, "ns", false, nil, cl)
+	assert.Len(t, desired.Spec.VolumeClaimTemplates, 1,
+		"the add case must not be silently stripped; it fails loudly and recreateStatefulSet is the supported route")
+}
+
+// recreateStatefulSet=true is the sanctioned way to change VCTs, so the desired spec is authoritative
+// there. A genuine resize (same template NAME, larger size) must survive instead of being reverted to
+// the stored capacity the way the non-recreate path does.
+func TestPatchStatefulSetLeavesVCTAloneWhenRecreating(t *testing.T) {
+	vct := func(size string) []corev1.PersistentVolumeClaim {
+		return []corev1.PersistentVolumeClaim{{
+			ObjectMeta: metav1.ObjectMeta{Name: "valkey"},
+			Spec: corev1.PersistentVolumeClaimSpec{
+				Resources: corev1.VolumeResourceRequirements{
+					Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)},
+				},
+			},
+		}}
+	}
+	stored := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "valkey", Namespace: "ns"},
+		Spec:       appsv1.StatefulSetSpec{VolumeClaimTemplates: vct("1Gi")},
+	}
+	desired := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "valkey", Namespace: "ns"},
+		Spec:       appsv1.StatefulSetSpec{VolumeClaimTemplates: vct("2Gi")},
+	}
+
+	cl := k8sClientFake.NewSimpleClientset(stored.DeepCopy())
+	err := patchStatefulSet(context.TODO(), stored, desired, "ns", true, nil, cl)
+	assert.NoError(t, err)
+	require.Len(t, desired.Spec.VolumeClaimTemplates, 1)
+	got := desired.Spec.VolumeClaimTemplates[0].Spec.Resources.Requests[corev1.ResourceStorage]
+	assert.Equal(t, "2Gi", got.String(),
+		"with recreateStatefulSet the desired VCT size is authoritative and must not be reverted to stored")
+}
+
+// The resize bookkeeping must ride along with the preserved templates, otherwise mergeAnnotations +
+// SetLastAppliedAnnotation make every subsequent three-way merge see a deletion -> a non-empty patch
+// -> an Update on EVERY reconcile, forever.
+func TestPatchStatefulSetCarriesStorageCapacityAnnotationWithPreservedVCT(t *testing.T) {
+	stored := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "valkey", Namespace: "ns",
+			Annotations: map[string]string{"storageCapacity": "1073741824"},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{ObjectMeta: metav1.ObjectMeta{Name: "valkey"}},
+			},
+		},
+	}
+	desired := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "valkey", Namespace: "ns"},
+		Spec:       appsv1.StatefulSetSpec{},
+	}
+
+	cl := k8sClientFake.NewSimpleClientset(stored.DeepCopy())
+	err := patchStatefulSet(context.TODO(), stored, desired, "ns", false, nil, cl)
+	assert.NoError(t, err)
+	assert.Equal(t, "1073741824", desired.Annotations["storageCapacity"],
+		"storageCapacity must be carried across or the operator updates on every reconcile forever")
+}
