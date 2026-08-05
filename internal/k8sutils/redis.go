@@ -1073,6 +1073,32 @@ func GetRedisReplicationRealMaster(ctx context.Context, client kubernetes.Interf
 	return ""
 }
 
+// GetRedisReplicationAttachedReplicasKnown reports whether the connected_slaves count could
+// actually be READ from every observed master.
+//
+// This exists because GetRedisReplicationRealMaster returning "" is AMBIGUOUS: checkAttachedSlave
+// returns -1 on any INFO failure (connection reset, timeout, TLS/auth error, a mid-fork stall) and
+// "" collapses that together with a genuine connected_slaves==0. Those two cases must not be
+// treated alike. "No master has an attached replica" is safe to bootstrap from; "we could not tell"
+// is NOT — a healthy master may exist, and electing a different one would SLAVEOF the real master
+// into a full resync that DISCARDS its writes.
+//
+// Callers that are about to elect a master from a degraded view should abstain unless this returns
+// true.
+func GetRedisReplicationAttachedReplicasKnown(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, masterPods []string) bool {
+	for _, podName := range masterPods {
+		redisClient := configureRedisReplicationClient(ctx, client, cr, podName)
+		defer redisClient.Close()
+
+		if checkAttachedSlave(ctx, redisClient, podName) < 0 {
+			log.FromContext(ctx).Info("Attached-replica count is UNKNOWN for a master; abstaining from master election",
+				"pod", podName)
+			return false
+		}
+	}
+	return true
+}
+
 func GetRedisReplicationBestMaster(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, masterPods []string) string {
 	var bestMasterPod string
 	var bestOffset int64 = -1
