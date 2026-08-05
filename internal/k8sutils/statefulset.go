@@ -218,6 +218,50 @@ func patchStatefulSet(ctx context.Context, storedStateful, newStateful *appsv1.S
 				log.FromContext(ctx).V(1).Info("VolumeClaimTemplate change is being ignored because the field is immutable. Consider enabling recreating the statefulset option.")
 			}
 		}
+	} else if !recreateStatefulSet &&
+		len(newStateful.Spec.VolumeClaimTemplates) < len(storedStateful.Spec.VolumeClaimTemplates) {
+		// The COUNT of VolumeClaimTemplates differs, which hasVolumeClaimTemplates deliberately does
+		// not cover (it only matches the equal-and-non-zero "resize" case). The common shape is a
+		// stored StatefulSet that HAS a VCT while the desired spec has none — e.g. the CR's storage
+		// stanza was removed, or the StatefulSet predates it.
+		//
+		// VolumeClaimTemplates are IMMUTABLE, so submitting that spec makes the API server reject the
+		// ENTIRE update:
+		//   StatefulSet.apps "<name>" is invalid: spec: Forbidden: updates to statefulset spec for
+		//   fields other than 'replicas', 'ordinals', 'template', 'updateStrategy', ... are forbidden
+		// and because reconcileResources returns that error, the whole Reconcile aborts before
+		// reconcileRedis and reconcileStatus ever run. The tenant then gets NO role labels, NO master
+		// election, NO split-brain repair and NO status — silently, every cycle, indefinitely.
+		// Observed on two live tenants whose StatefulSets had carried a 1Gi VCT for ~76 days.
+		//
+		// Removing (or adding) a VCT is impossible via update regardless, so carry the stored ones
+		// forward and let the rest of the reconcile proceed. A genuine VCT change still requires
+		// recreateStatefulSet, which is why this is scoped to the non-recreate path.
+		//
+		// Deliberately `<` and NOT `!=`. The ADD case (desired has MORE templates than the live
+		// StatefulSet) must be left alone: getVolumeMount() emits a /data volumeMount named after the
+		// VCT whenever persistence is enabled, and that mount is part of the pod TEMPLATE, which is
+		// mutable. Stripping the template while keeping the mount yields a spec the API server rejects
+		// with `volumeMounts[0].name: Not found` — and on any apiserver that skips pod-template
+		// validation it is worse still: the update is accepted and the rolling update then deletes a
+		// pod the controller can never recreate. The add case already fails loudly today and stays
+		// that way; recreateStatefulSet remains the supported route for it.
+		log.FromContext(ctx).Info("Desired StatefulSet declares FEWER VolumeClaimTemplates than the live one; preserving the stored templates because the field is immutable. Enable recreating the statefulset to change them.",
+			"desired", len(newStateful.Spec.VolumeClaimTemplates),
+			"stored", len(storedStateful.Spec.VolumeClaimTemplates),
+		)
+		// Carry the resize bookkeeping across too. The sibling branch sets this BEFORE Calculate;
+		// without it mergeAnnotations restores the annotation afterwards, SetLastAppliedAnnotation
+		// bakes it into last-applied, and every later CreateThreeWayMergePatch sees a deletion — a
+		// non-empty patch, hence an Update, on EVERY reconcile forever. Measured: 5 updates per 5
+		// reconciles instead of 1.
+		if newStateful.Annotations == nil {
+			newStateful.Annotations = make(map[string]string)
+		}
+		if cap, ok := storedStateful.Annotations["storageCapacity"]; ok {
+			newStateful.Annotations["storageCapacity"] = cap
+		}
+		newStateful.Spec.VolumeClaimTemplates = storedStateful.Spec.VolumeClaimTemplates
 	}
 
 	// Since PodManagementPolicy is immutable, revert to the stored value if we
