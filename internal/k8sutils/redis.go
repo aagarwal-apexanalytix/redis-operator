@@ -1031,20 +1031,19 @@ func CreateMasterSlaveReplication(ctx context.Context, client kubernetes.Interfa
 		Namespace: cr.Namespace,
 	}
 
-	var realMasterAddr string
-	if cr.Spec.TLS != nil {
-		// Use DNS name for TLS connections to match certificate validation
-		realMasterAddr = getRedisReplicationHostname(realMasterInfo, cr)
-		log.FromContext(ctx).V(1).Info("Using DNS address for TLS master replication", "masterAddr", realMasterAddr)
-	} else {
-		// Use IP address for non-TLS connections
-		realMasterPodIP := getRedisServerIP(ctx, client, realMasterInfo)
-		if realMasterPodIP == "" {
-			return errors.New("CreateMasterSlaveReplication got empty master IP, refusing")
-		}
-		realMasterAddr = realMasterPodIP
-		log.FromContext(ctx).V(1).Info("Using IP address for non-TLS master replication", "masterAddr", realMasterAddr)
+	// Address the master by its stable headless DNS name (pod.<name>-headless.<ns>.svc.<domain>)
+	// for BOTH TLS and non-TLS, rather than the master's Pod IP. A name follows the pod across a
+	// reschedule, so a replica's `replicaof` re-resolves and re-attaches when the master's Pod IP
+	// changes — instead of being stranded on a recycled IP with master_link_status:down (the
+	// churn-proportional "ghost-master" class). Previously only the TLS path used the DNS name; the
+	// non-TLS path pinned the resolved Pod IP, which a master reschedule then orphaned. We still
+	// require the elected master pod to have an IP first (i.e. it is scheduled + running) so we never
+	// stitch toward a not-yet-ready master. (apexanalytix fork: gitea iac #1135)
+	if getRedisServerIP(ctx, client, realMasterInfo) == "" {
+		return errors.New("CreateMasterSlaveReplication got empty master IP, refusing")
 	}
+	realMasterAddr := getRedisReplicationHostname(realMasterInfo, cr)
+	log.FromContext(ctx).V(1).Info("Using DNS address for master replication", "masterAddr", realMasterAddr)
 
 	for i := 0; i < len(masterPods); i++ {
 		if masterPods[i] != realMasterPod {
@@ -1072,6 +1071,32 @@ func GetRedisReplicationRealMaster(ctx context.Context, client kubernetes.Interf
 		}
 	}
 	return ""
+}
+
+// GetRedisReplicationAttachedReplicasKnown reports whether the connected_slaves count could
+// actually be READ from every observed master.
+//
+// This exists because GetRedisReplicationRealMaster returning "" is AMBIGUOUS: checkAttachedSlave
+// returns -1 on any INFO failure (connection reset, timeout, TLS/auth error, a mid-fork stall) and
+// "" collapses that together with a genuine connected_slaves==0. Those two cases must not be
+// treated alike. "No master has an attached replica" is safe to bootstrap from; "we could not tell"
+// is NOT — a healthy master may exist, and electing a different one would SLAVEOF the real master
+// into a full resync that DISCARDS its writes.
+//
+// Callers that are about to elect a master from a degraded view should abstain unless this returns
+// true.
+func GetRedisReplicationAttachedReplicasKnown(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, masterPods []string) bool {
+	for _, podName := range masterPods {
+		redisClient := configureRedisReplicationClient(ctx, client, cr, podName)
+		defer redisClient.Close()
+
+		if checkAttachedSlave(ctx, redisClient, podName) < 0 {
+			log.FromContext(ctx).Info("Attached-replica count is UNKNOWN for a master; abstaining from master election",
+				"pod", podName)
+			return false
+		}
+	}
+	return true
 }
 
 func GetRedisReplicationBestMaster(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, masterPods []string) string {

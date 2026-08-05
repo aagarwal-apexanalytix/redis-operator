@@ -3,6 +3,7 @@ package redisreplication
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -39,6 +40,7 @@ type Reconciler struct {
 	RedisNodesByRole           func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, string) ([]string, error)
 	RedisReplicationRealMaster func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string
 	CreateRedisReplicationLink func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string, string) error
+	AttachedReplicasKnown      func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) bool
 	ConfigureSentinel          func(context.Context, *rrvb2.RedisReplication, string) error
 }
 
@@ -136,6 +138,16 @@ func (r *Reconciler) createRedisReplicationLink(ctx context.Context, instance *r
 		return r.CreateRedisReplicationLink(ctx, r.K8sClient, instance, pods, realMaster)
 	}
 	return k8sutils.CreateMasterSlaveReplication(ctx, r.K8sClient, instance, pods, realMaster)
+}
+
+// attachedReplicasKnown reports whether every observed master's connected_slaves count was actually
+// readable. See GetRedisReplicationAttachedReplicasKnown: a failed probe and a genuine zero both
+// surface as realMaster=="" , and only the latter is safe to elect a new master from.
+func (r *Reconciler) attachedReplicasKnown(ctx context.Context, instance *rrvb2.RedisReplication, masterNodes []string) bool {
+	if r.AttachedReplicasKnown != nil {
+		return r.AttachedReplicasKnown(ctx, r.K8sClient, instance, masterNodes)
+	}
+	return k8sutils.GetRedisReplicationAttachedReplicasKnown(ctx, r.K8sClient, instance, masterNodes)
 }
 
 func (r *Reconciler) configureReplicationSentinel(ctx context.Context, instance *rrvb2.RedisReplication, masterPodName string) error {
@@ -420,12 +432,39 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 		log.FromContext(ctx).Info("Creating redis replication by executing replication creation commands")
 
 		// Cascading fallback when no pod currently has connected_slaves > 0.
-		// Only bootstrap from a complete topology with no slaves so a master is
-		// never elected from a partial view of the pods.
-		if realMaster == "" && len(slaveNodes) == 0 && !incompleteTopology {
-			// Reuse the last-known master from Status.MasterNode if it is still
-			// running, so a full restart does not arbitrarily move the master.
-			if instance.Status.MasterNode != "" && k8sutils.IsPodRunning(ctx, r.K8sClient, instance.Namespace, instance.Status.MasterNode) {
+		// Only bootstrap from a COMPLETE topology so a master is never elected from a
+		// partial view of the pods.
+		//
+		// Deliberately NOT gated on len(slaveNodes)==0. A pod that self-reports `role:slave` is
+		// not evidence of a healthy replication link: after a master reschedule a replica can sit
+		// on `replicaof <recycled-IP>` with master_link_status:down — a slave in name only,
+		// attached to nothing live. That clause DEADLOCKED the exact split-brain this block exists
+		// to repair: with 2 masters + 1 orphaned replica the whole fallback chain was skipped and
+		// the reconcile logged "current master could not be identified" every 30s, forever.
+		//
+		// It is replaced by TWO precise guards rather than dropped outright:
+		//   !incompleteTopology       — never elect from a partial view of the pods (unchanged).
+		//   attachedReplicasKnown     — `realMaster == ""` is AMBIGUOUS: checkAttachedSlave returns
+		//     -1 on any INFO failure and GetRedisReplicationRealMaster collapses that together with
+		//     a genuine connected_slaves==0. Bootstrapping on an unreadable probe could elect a new
+		//     master while a HEALTHY master/replica link exists, SLAVEOF-ing the real master into a
+		//     resync that discards its writes. So we only bootstrap when every master's replica
+		//     count was actually read.
+		if realMaster == "" && !incompleteTopology && r.attachedReplicasKnown(ctx, instance, masterNodes) {
+			// Reuse the last-known master from Status.MasterNode if it is still running, so a
+			// full restart does not arbitrarily move the master.
+			//
+			// It MUST still be one of the observed masters. Status.MasterNode is only a memory of
+			// a previous reconcile, and the pod it names can since have come back as a SLAVE —
+			// precisely the incident mechanism here (a replica restarted holding
+			// `replicaof <recycled-IP>` in its emptyDir conf). Electing a slave would then SLAVEOF
+			// every real master onto it, leaving ZERO masters; the next reconcile sees
+			// len(masterNodes)==0, neither branch fires, and the set is permanently wedged —
+			// strictly worse than the split-brain being repaired. IsPodRunning alone does not
+			// catch this because the pod is running perfectly well; it is just not a master.
+			if instance.Status.MasterNode != "" &&
+				slices.Contains(masterNodes, instance.Status.MasterNode) &&
+				k8sutils.IsPodRunning(ctx, r.K8sClient, instance.Namespace, instance.Status.MasterNode) {
 				log.FromContext(ctx).Info("No master with attached slaves found, falling back to Status.MasterNode",
 					"statusMasterNode", instance.Status.MasterNode)
 				realMaster = instance.Status.MasterNode
@@ -461,25 +500,35 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 			return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
 		}
 	} else if len(masterNodes) == 1 && len(slaveNodes) > 0 {
-		currentRealMaster := r.redisReplicationRealMaster(ctx, instance, masterNodes)
+		realMaster = masterNodes[0]
 
-		if currentRealMaster == "" && !instance.EnableSentinel() {
-			log.FromContext(ctx).Info("Detected disconnected slaves, reconfiguring replication",
+		// Continuously ENFORCE replication: re-point every replica at the single master on
+		// every reconcile. SLAVEOF to the current master is idempotent (a no-op for a replica
+		// already attached to it), so this is safe to run each cycle and repairs a replica that
+		// has drifted off a LIVE master — e.g. one left `replicaof <recycled-IP>` (link down)
+		// after a master reschedule, or `replicaof <self>` after a botched re-stitch.
+		//
+		// Upstream's guard (`currentRealMaster == "" && !instance.EnableSentinel()`) only
+		// re-stitches when the master has ZERO attached slaves AND sentinel is disabled. In the
+		// apexanalytix deployment sentinel is ENABLED and at least one replica is usually still
+		// attached, so a single drifted replica falls through untouched forever: this reconcile
+		// skips it, and Sentinel only reconfigures replicas during a master FAILOVER (sdown/
+		// odown) — it never heals a replica that wandered off a master that is still up. Net is a
+		// churn-proportional ghost-master that self-heals through neither layer.
+		//
+		// NOTE: upstream's RepairDisconnectedNodes (#1705) does NOT cover this — it is wired into
+		// the RedisCluster controller only, not RedisReplication (our topology). (gitea iac #1135)
+		//
+		// The incompleteTopology guard is upstream's (#1720 class): never stitch from a partial
+		// view of the pods, or a mid-rollout reconcile can point replicas at a transient master.
+		if incompleteTopology {
+			log.FromContext(ctx).Info("Skipping master-slave enforcement because the observed topology is incomplete",
+				"observedPods", observedPods,
+				"expectedPods", *instance.Spec.Size)
+		} else if err := r.createRedisReplicationLink(ctx, instance, slaveNodes, realMaster); err != nil {
+			log.FromContext(ctx).Error(err, "Failed to enforce master-slave replication",
 				"master", realMaster, "slaves", slaveNodes)
-
-			if incompleteTopology {
-				log.FromContext(ctx).Info("Skipping master-slave reconfiguration because the observed topology is incomplete",
-					"observedPods", observedPods,
-					"expectedPods", *instance.Spec.Size)
-			} else {
-				allPods := append(masterNodes, slaveNodes...)
-				if err := r.createRedisReplicationLink(ctx, instance, allPods, realMaster); err != nil {
-					log.FromContext(ctx).Error(err, "Failed to reconfigure master-slave replication",
-						"master", realMaster, "slaves", slaveNodes)
-					return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
-				}
-				log.FromContext(ctx).Info("Successfully reconfigured slave replication")
-			}
+			return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
 		}
 	}
 
