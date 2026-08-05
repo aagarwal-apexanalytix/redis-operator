@@ -13,11 +13,13 @@ import (
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/envs"
 	"github.com/OT-CONTAINER-KIT/redis-operator/internal/k8sutils"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 const (
@@ -112,6 +114,36 @@ func (r *RedisSentinelReconciler) reconcileReplication(ctx context.Context, inst
 	return intctrlutil.Reconciled()
 }
 
+// sentinelMonitorAddress builds the address SENTINEL MONITOR is pointed at, returning ok=false
+// when the replication master is not identifiable.
+//
+// That case is real and routine, not defensive padding: GetMasterFromReplication returns a
+// ZERO-VALUE pod with a NIL error whenever no master has an attached replica (its loop simply
+// never assigns realMasterPod) — exactly the state during a split-brain. Formatting that empty pod
+// produced "..<ns>.svc.<domain>": both the pod name AND the headless-service name are empty, since
+// GetHeadlessServiceNameFromPodName("") == "". SENTINEL MONITOR rejects that with
+// "ERR Invalid IP address or hostname specified", and because the error aborts reconcileSentinel
+// BEFORE SentinelSet and SentinelReset run, the sentinel topology is never repaired and the error
+// repeats every reconcile — observed live as sentinel_masters:0 on one sentinel and num-slaves:0
+// on the others, with the split-brain persisting indefinitely.
+//
+// Returning ok=false keeps the malformed address unconstructible rather than relying on every
+// caller to remember the empty-pod case.
+func sentinelMonitorAddress(master corev1.Pod, namespace, dnsDomain string, resolveHostnames bool) (string, bool) {
+	if master.Name == "" {
+		return "", false
+	}
+	if resolveHostnames {
+		return fmt.Sprintf("%s.%s.%s.svc.%s",
+			master.Name, common.GetHeadlessServiceNameFromPodName(master.Name), namespace, dnsDomain), true
+	}
+	// Same class of hole on the IP path: a pod that exists but has no IP assigned yet.
+	if master.Status.PodIP == "" {
+		return "", false
+	}
+	return master.Status.PodIP, true
+}
+
 func (r *RedisSentinelReconciler) reconcileSentinel(ctx context.Context, instance *rsvb2.RedisSentinel) (ctrl.Result, error) {
 	if err := k8sutils.CreateRedisSentinel(ctx, r.K8sClient, instance, r.K8sClient, r.Client); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
@@ -132,10 +164,15 @@ func (r *RedisSentinelReconciler) reconcileSentinel(ctx context.Context, instanc
 	if master, err := r.Checker.GetMasterFromReplication(ctx, rr); err != nil {
 		return intctrlutil.RequeueE(ctx, err, "")
 	} else {
-		if instance.Spec.RedisSentinelConfig.ResolveHostnames == "yes" {
-			monitorAddr = fmt.Sprintf("%s.%s.%s.svc.%s", master.Name, common.GetHeadlessServiceNameFromPodName(master.Name), rr.Namespace, envs.GetServiceDNSDomain())
-		} else {
-			monitorAddr = master.Status.PodIP
+		var ok bool
+		monitorAddr, ok = sentinelMonitorAddress(master, rr.Namespace, envs.GetServiceDNSDomain(),
+			instance.Spec.RedisSentinelConfig.ResolveHostnames == "yes")
+		if !ok {
+			// Electing the master is the RedisReplication controller's job, not ours. Requeue quietly
+			// and let it converge; sending a knowingly-invalid address helps nobody and hides the state.
+			log.FromContext(ctx).Info("Skipping sentinel monitor: replication has no identifiable master yet",
+				"redisReplication", rr.Name)
+			return intctrlutil.RequeueAfter(ctx, time.Second*30, "")
 		}
 	}
 	if err := r.Healer.SentinelMonitor(ctx, instance, monitorAddr); err != nil {
