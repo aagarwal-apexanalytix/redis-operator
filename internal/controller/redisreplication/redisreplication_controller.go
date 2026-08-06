@@ -530,6 +530,45 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 				"master", realMaster, "slaves", slaveNodes)
 			return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
 		}
+	} else if len(masterNodes) == 0 && len(slaveNodes) > 0 {
+		// TOTAL MASTER LOSS: no pod reports role:master, yet replicas exist. Typically the previous
+		// master pod was deleted and its Pod IP recycled, leaving every replica pointed at a node
+		// that is no longer their master. Neither this loop nor Sentinel recovers it: the branches
+		// above only handle >1 and ==1 masters, and Sentinel may still consider the stale master
+		// address "up", so it never fails over. Without this the set stays master-less forever.
+		//
+		// (Re-landed from a fork commit that was retired on the claim that upstream's offset-based
+		// election superseded it. It does not: electing the highest-offset master is meaningless
+		// when the master set is EMPTY, and nothing else in the tree issues SLAVEOF NO ONE.)
+		//
+		// Guards mirror the >1 branch deliberately:
+		//   !incompleteTopology  — never promote from a partial view; a mid-rollout reconcile that
+		//     sees only some pods could promote one while an unobserved master is still serving,
+		//     manufacturing the very split-brain the other branch exists to repair.
+		//   slices.Contains      — Status.MasterNode is only a memory of a past reconcile. It must
+		//     still be one of the OBSERVED replicas; IsPodRunning alone would happily elect a pod
+		//     that is running but is not part of this set (or no longer exists as a replica).
+		if incompleteTopology {
+			log.FromContext(ctx).Info("Skipping replica promotion because the observed topology is incomplete",
+				"observedPods", observedPods,
+				"expectedPods", *instance.Spec.Size)
+		} else {
+			realMaster = slaveNodes[0]
+			if instance.Status.MasterNode != "" &&
+				slices.Contains(slaveNodes, instance.Status.MasterNode) &&
+				k8sutils.IsPodRunning(ctx, r.K8sClient, instance.Namespace, instance.Status.MasterNode) {
+				log.FromContext(ctx).Info("No master found; preferring last-known master from status for promotion",
+					"statusMasterNode", instance.Status.MasterNode)
+				realMaster = instance.Status.MasterNode
+			}
+			log.FromContext(ctx).Info("No master found among replication pods; promoting a replica to master",
+				"electedMaster", realMaster, "replicas", slaveNodes)
+			if err := r.createRedisReplicationLink(ctx, instance, slaveNodes, realMaster); err != nil {
+				log.FromContext(ctx).Error(err, "Failed to promote replica to master", "electedMaster", realMaster)
+				return intctrlutil.RequeueAfter(ctx, time.Second*60, "")
+			}
+			log.FromContext(ctx).Info("Successfully promoted replica to master", "master", realMaster)
+		}
 	}
 
 	monitoring.RedisReplicationReplicasSizeMismatch.WithLabelValues(instance.Namespace, instance.Name).Set(0)
