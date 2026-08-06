@@ -1291,3 +1291,97 @@ func TestReconcileRedisAbstainsWhenAttachedReplicaCountsAreUnreadable(t *testing
 	assert.Equal(t, ctrl.Result{}, result)
 	assert.False(t, createCalled, "must not elect a master from an unreadable view (possible data loss)")
 }
+
+// Regression: TOTAL MASTER LOSS — no pod reports role:master but replicas exist (the previous
+// master's Pod IP was recycled). Neither the >1 nor the ==1 branch fires, and Sentinel may still
+// consider the stale master "up", so without a ==0 branch the set stays master-less forever.
+func TestReconcileRedisPromotesAReplicaWhenNoMasterRemains(t *testing.T) {
+	createCalled := false
+	var gotPods []string
+	var gotMaster string
+	r := &Reconciler{
+		K8sClient: fake.NewSimpleClientset(),
+		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
+			if role == "master" {
+				return nil, nil // NOBODY is a master
+			}
+			return []string{"example-replication-0", "example-replication-1", "example-replication-2"}, nil
+		},
+		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
+			return ""
+		},
+		CreateRedisReplicationLink: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, pods []string, realMaster string) error {
+			createCalled = true
+			gotPods = append([]string{}, pods...)
+			gotMaster = realMaster
+			return nil
+		},
+	}
+
+	result, err := r.reconcileRedis(context.Background(), newReplicationInstanceForTest())
+
+	require.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+	assert.True(t, createCalled, "a master-less set must promote a replica")
+	assert.Equal(t, "example-replication-0", gotMaster)
+	assert.ElementsMatch(t, []string{"example-replication-0", "example-replication-1", "example-replication-2"}, gotPods)
+}
+
+// A stale Status.MasterNode naming a pod that is NOT among the observed replicas must not be
+// promoted — same class of hole the split-brain branch was hardened against.
+func TestReconcileRedisIgnoresStaleStatusMasterNotAmongReplicas(t *testing.T) {
+	var gotMaster string
+	r := &Reconciler{
+		K8sClient: fake.NewSimpleClientset(&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "example-replication-9", Namespace: "default"},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		}),
+		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
+			if role == "master" {
+				return nil, nil
+			}
+			return []string{"example-replication-0", "example-replication-1", "example-replication-2"}, nil
+		},
+		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
+			return ""
+		},
+		CreateRedisReplicationLink: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, _ []string, realMaster string) error {
+			gotMaster = realMaster
+			return nil
+		},
+	}
+
+	instance := newReplicationInstanceForTest()
+	instance.Status.MasterNode = "example-replication-9" // running, but NOT one of the replicas
+
+	_, err := r.reconcileRedis(context.Background(), instance)
+	require.NoError(t, err)
+	assert.Equal(t, "example-replication-0", gotMaster,
+		"must fall back to an observed replica, never elect a pod outside the set")
+}
+
+// Never promote from a partial view: an incomplete topology could promote while an unobserved
+// master is still serving, manufacturing a split-brain.
+func TestReconcileRedisDoesNotPromoteOnIncompleteTopology(t *testing.T) {
+	createCalled := false
+	r := &Reconciler{
+		K8sClient: fake.NewSimpleClientset(),
+		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
+			if role == "master" {
+				return nil, nil
+			}
+			return []string{"example-replication-0"}, nil // only 1 of 3 observed
+		},
+		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
+			return ""
+		},
+		CreateRedisReplicationLink: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string, string) error {
+			createCalled = true
+			return nil
+		},
+	}
+
+	_, err := r.reconcileRedis(context.Background(), newReplicationInstanceForTest())
+	require.NoError(t, err)
+	assert.False(t, createCalled, "must not promote from a partial view of the pods")
+}
