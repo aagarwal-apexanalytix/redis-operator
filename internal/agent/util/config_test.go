@@ -133,3 +133,143 @@ func assertWritableByNonOwner(t *testing.T, path, what string) {
 			"\"config file ... is not writable: Permission denied\"", what, mode)
 	}
 }
+
+// TestCommitReplacesFileItCannotOpenForWriting is the regression test for the wedge that took 50
+// Sentinel pods across 40 namespaces offline on 2026-08-26.
+//
+// After the first successful start the config on disk is no longer the file the init container
+// wrote: Sentinel rewrites its own config at runtime and the result is owned by the SENTINEL
+// runtime user. The init container runs as a different (non-root) user, so a Commit that opens the
+// target O_TRUNC gets "permission denied" and the pod never starts again — permanently, because an
+// emptyDir survives sandbox recreation and a StatefulSet cannot progress past a non-Ready pod-0.
+//
+// A read-only existing file reproduces the same "cannot open the existing target for writing"
+// condition portably. This test FAILS against the previous os.WriteFile implementation.
+func TestCommitReplacesFileItCannotOpenForWriting(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: DAC permission checks are bypassed, so this condition cannot be reproduced")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sentinel.conf")
+
+	// Stand in for the file Sentinel rewrote: present, and not writable by us.
+	if err := os.WriteFile(path, []byte("stale config from a previous run\n"), 0o444); err != nil {
+		t.Fatalf("seeding read-only config failed: %v", err)
+	}
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatalf("chmod 0444 failed: %v", err)
+	}
+
+	cfg := NewConfig(path, "# generated")
+	cfg.Append("sentinel monitor", "mymaster", "10.0.0.1", "6379", "2")
+	if err := cfg.Commit(); err != nil {
+		t.Fatalf("Commit must replace a config it cannot open for writing, got: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile failed: %v", err)
+	}
+	if strings.Contains(string(got), "stale config from a previous run") {
+		t.Errorf("stale content survived Commit; rendered config:\n%s", got)
+	}
+	if !strings.Contains(string(got), "sentinel monitor mymaster 10.0.0.1 6379 2") {
+		t.Errorf("freshly generated directive missing; rendered config:\n%s", got)
+	}
+}
+
+// TestCommitReplacesByRenameNotTruncate proves the mechanism rather than one symptom of it, and
+// unlike the test above it holds even when the suite runs as root: a rename installs a NEW inode,
+// an in-place truncate reuses the existing one. Renaming is what makes Commit independent of who
+// owns the file already there — it needs only write+execute on the directory.
+func TestCommitReplacesByRenameNotTruncate(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sentinel.conf")
+
+	if err := os.WriteFile(path, []byte("previous\n"), 0o644); err != nil {
+		t.Fatalf("seeding config failed: %v", err)
+	}
+	var before syscall.Stat_t
+	if err := syscall.Stat(path, &before); err != nil {
+		t.Fatalf("stat before failed: %v", err)
+	}
+
+	cfg := NewConfig(path, "# generated")
+	if err := cfg.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	var after syscall.Stat_t
+	if err := syscall.Stat(path, &after); err != nil {
+		t.Fatalf("stat after failed: %v", err)
+	}
+	if before.Ino == after.Ino {
+		t.Errorf("config was truncated in place (inode %d unchanged); Commit must rename a new file over the target", after.Ino)
+	}
+}
+
+// TestCommitLeavesNoTempFiles guards the rename's own failure mode: a temp file abandoned in the
+// config directory. Sentinel's config directory is also its working directory, so litter there is
+// not harmless.
+func TestCommitLeavesNoTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sentinel.conf")
+
+	cfg := NewConfig(path, "# generated")
+	if err := cfg.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "sentinel.conf" {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("expected only sentinel.conf in the config dir, got %v", names)
+	}
+}
+
+// TestTempPatternDerivesFromTarget is the REAL control on temp-file naming. The end-state test below
+// cannot provide one: a successful Commit renames the temp away, so the directory afterwards looks
+// identical whatever the temp was called. Asserting on the pattern directly is what actually fails if
+// someone reintroduces a hardcoded name.
+func TestTempPatternDerivesFromTarget(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"/etc/redis/sentinel.conf", ".sentinel.conf.*"},
+		{"/etc/redis/redis.conf", ".redis.conf.*"},
+		{"redis.conf", ".redis.conf.*"},
+	} {
+		if got := tempPattern(tc.path); got != tc.want {
+			t.Errorf("tempPattern(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestCommitOnRedisPathLeavesOnlyTheTarget exercises Commit on the OTHER shared bootstrap path.
+// NB this is an end-state assertion, not a naming control — see TestTempPatternDerivesFromTarget for
+// that. It is kept because it does prove the redis path commits cleanly and leaves no litter.
+func TestCommitOnRedisPathLeavesOnlyTheTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "redis.conf")
+
+	cfg := NewConfig(path, "# generated")
+	if err := cfg.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "sentinel") {
+			t.Errorf("redis.conf Commit left a sentinel-named artefact: %q", e.Name())
+		}
+	}
+	if len(entries) != 1 || entries[0].Name() != "redis.conf" {
+		t.Errorf("expected only redis.conf, got %d entries", len(entries))
+	}
+}
