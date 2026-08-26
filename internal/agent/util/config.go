@@ -69,6 +69,16 @@ func (c *Config) Append(config ...string) *Config {
 // leaving group read-only. The file mode is the binding constraint.
 const configFileMode = 0o666
 
+// tempPattern derives the os.CreateTemp pattern from the TARGET file rather than hardcoding a name.
+// Commit() is shared by both bootstrap paths — sentinel.conf and redis.conf — and they share
+// /etc/redis, so a hardcoded ".sentinel.conf.*" would leave sentinel-named temporaries behind while
+// writing redis.conf, and would name them after a file that Commit was never writing if it failed
+// midway. Factored out as a function so the naming is directly testable: after a SUCCESSFUL Commit
+// the temp has been renamed away, so no end-state assertion on the directory can observe it.
+func tempPattern(path string) string {
+	return "." + filepath.Base(path) + ".*"
+}
+
 func (c *Config) Commit() error {
 	dir := filepath.Dir(c.path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -97,7 +107,7 @@ func (c *Config) Commit() error {
 	// and the failure is that it cannot open it at all. Rename needs only WRITE+EXECUTE on the
 	// DIRECTORY, which the config volume grants, so it works regardless of who owns the existing
 	// file — and it is atomic, so a reader never sees a partial config.
-	tmp, err := os.CreateTemp(dir, ".sentinel.conf.*")
+	tmp, err := os.CreateTemp(dir, tempPattern(c.path))
 	if err != nil {
 		return fmt.Errorf("failed to create temp config in %s: %v", dir, err)
 	}

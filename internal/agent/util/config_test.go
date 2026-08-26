@@ -232,3 +232,44 @@ func TestCommitLeavesNoTempFiles(t *testing.T) {
 		t.Errorf("expected only sentinel.conf in the config dir, got %v", names)
 	}
 }
+
+// TestTempPatternDerivesFromTarget is the REAL control on temp-file naming. The end-state test below
+// cannot provide one: a successful Commit renames the temp away, so the directory afterwards looks
+// identical whatever the temp was called. Asserting on the pattern directly is what actually fails if
+// someone reintroduces a hardcoded name.
+func TestTempPatternDerivesFromTarget(t *testing.T) {
+	for _, tc := range []struct{ path, want string }{
+		{"/etc/redis/sentinel.conf", ".sentinel.conf.*"},
+		{"/etc/redis/redis.conf", ".redis.conf.*"},
+		{"redis.conf", ".redis.conf.*"},
+	} {
+		if got := tempPattern(tc.path); got != tc.want {
+			t.Errorf("tempPattern(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestCommitOnRedisPathLeavesOnlyTheTarget exercises Commit on the OTHER shared bootstrap path.
+// NB this is an end-state assertion, not a naming control — see TestTempPatternDerivesFromTarget for
+// that. It is kept because it does prove the redis path commits cleanly and leaves no litter.
+func TestCommitOnRedisPathLeavesOnlyTheTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "redis.conf")
+
+	cfg := NewConfig(path, "# generated")
+	if err := cfg.Commit(); err != nil {
+		t.Fatalf("Commit failed: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "sentinel") {
+			t.Errorf("redis.conf Commit left a sentinel-named artefact: %q", e.Name())
+		}
+	}
+	if len(entries) != 1 || entries[0].Name() != "redis.conf" {
+		t.Errorf("expected only redis.conf, got %d entries", len(entries))
+	}
+}
