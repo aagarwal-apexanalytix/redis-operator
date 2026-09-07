@@ -1136,7 +1136,82 @@ func checkAttachedSlave(ctx context.Context, redisClient *redis.Client, podName 
 	return 0
 }
 
+// redisReplicationPort is the port every pod in a RedisReplication set serves on. It is hardcoded
+// in CreateMasterSlaveReplication's SLAVEOF call, and INFO Replication reports `master_port` in the
+// same terms, so the two must be compared against the same constant.
+const redisReplicationPort = "6379"
+
+// parseReplicationTarget reports the master a pod is CURRENTLY replicating from, exactly as the pod
+// itself reports it in INFO Replication (`master_host` / `master_port`).
+//
+// known is false when the pod is not replicating from anything — a pod serving as a master emits
+// neither field — or when the INFO payload did not carry both fields. Callers MUST treat
+// known==false as "cannot tell, issue the command anyway", never as "nothing to do": an unreadable
+// probe has to degrade to the previous unconditional behaviour, or a genuinely drifted replica
+// would be silently skipped and the continuous-enforcement guarantee this operator carries
+// (fork commit cf1d993e) would be lost.
+func parseReplicationTarget(info string) (host string, port string, known bool) {
+	// The trailing colon in each prefix is load-bearing. Of the 32 fields valkey emits in this
+	// section, `master_host:` and `master_port:` each match exactly one, and no other field name is
+	// a prefix of either — without the colon, `master_port:` would also swallow nothing but
+	// `master_host:` sits next to master_repl_offset, master_replid, master_link_status and
+	// master_last_io_seconds_ago. Keep the colons if this is ever edited.
+	//
+	// No TrimSpace: the value is what redis's own config tokenizer stored (it splits on whitespace,
+	// so it cannot carry padding), lines are already split on the \r\n INFO uses, and trimming
+	// could only ever turn a valkey NON-match into a match here — i.e. skip a command valkey would
+	// have honoured, which is the one direction this guard must never fail in.
+	for _, line := range strings.Split(info, "\r\n") {
+		switch {
+		case strings.HasPrefix(line, "master_host:"):
+			host = strings.TrimPrefix(line, "master_host:")
+		case strings.HasPrefix(line, "master_port:"):
+			port = strings.TrimPrefix(line, "master_port:")
+		}
+	}
+	return host, port, host != "" && port != ""
+}
+
+// replicationTargetMatches reports whether a replica is ALREADY attached to masterAddr:masterPort,
+// which makes a REPLICAOF/SLAVEOF toward that same address a pure no-op.
+//
+// Hostnames are compared case-insensitively because the compared values are DNS names, which are
+// case-insensitive; the operator always builds the same lowercase FQDN, but a replica stitched by
+// some other actor need not have been given that exact spelling.
+func replicationTargetMatches(info, masterAddr, masterPort string) bool {
+	host, port, known := parseReplicationTarget(info)
+	if !known {
+		return false
+	}
+	return strings.EqualFold(host, masterAddr) && port == masterPort
+}
+
+// isAlreadyReplicaOf answers replicationTargetMatches for a live pod, failing OPEN: any INFO error
+// returns false, so the caller issues the command exactly as it did before this guard existed.
+func isAlreadyReplicaOf(ctx context.Context, redisClient *redis.Client, podName, masterAddr, masterPort string) bool {
+	info, err := redisClient.Info(ctx, "Replication").Result()
+	if err != nil {
+		// Not an error for the caller: the SLAVEOF below is still issued. Logged at V(1) because a
+		// transient INFO failure here is self-correcting and costs only one redundant command.
+		log.FromContext(ctx).V(1).Info("Could not read replication info before SLAVEOF; issuing it unconditionally",
+			"pod", podName, "error", err.Error())
+		return false
+	}
+	return replicationTargetMatches(info, masterAddr, masterPort)
+}
+
 func CreateMasterSlaveReplication(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, masterPods []string, realMasterPod string) error {
+	return createMasterSlaveReplication(ctx, client, cr, masterPods, realMasterPod, func(podName string) *redis.Client {
+		return configureRedisReplicationClient(ctx, client, cr, podName)
+	})
+}
+
+// createMasterSlaveReplication takes the redis-client constructor as a parameter so the SKIP
+// decision below is reachable from a test, mirroring setRedisReplicationDynamicConfig /
+// repairDisconnectedNodes in this file. Without the seam the guard is only testable one level down,
+// at isAlreadyReplicaOf — and a unit-green helper proves nothing about the call site that uses it:
+// every fixture still passed with the whole guard deleted.
+func createMasterSlaveReplication(ctx context.Context, client kubernetes.Interface, cr *rrvb2.RedisReplication, masterPods []string, realMasterPod string, makeClient func(podName string) *redis.Client) error {
 	log.FromContext(ctx).V(1).Info("Redis Master Node is set to", "pod", realMasterPod)
 	realMasterInfo := RedisDetails{
 		PodName:   realMasterPod,
@@ -1163,8 +1238,14 @@ func CreateMasterSlaveReplication(ctx context.Context, client kubernetes.Interfa
 	// loop below would merely chain replicas onto ANOTHER replica and the set would never regain a
 	// master. Promoting a pod that is already a master is a no-op, so this is safe for every caller
 	// including the ordinary split-brain re-stitch.
-	masterClient := configureRedisReplicationClient(ctx, client, cr, realMasterPod)
+	masterClient := makeClient(realMasterPod)
 	defer masterClient.Close()
+	// DELIBERATELY UNCONDITIONAL. It is tempting to gate this on "the pod already reports
+	// role:master", but that would be scope this change has not earned: valkey logs NOTHING when
+	// SLAVEOF NO ONE reaches a pod that is already a master (replication.c: the "PRIMARY MODE
+	// enabled" log sits INSIDE `if (server.primary_host)`), so gating it suppresses zero log lines
+	// — while making the total-master-loss promotion path above conditional. That path is the one
+	// that recovers a set with no master at all; it stays exactly as it was.
 	log.FromContext(ctx).V(1).Info("Promoting elected master node", "pod", realMasterPod)
 	if err := masterClient.SlaveOf(ctx, "NO", "ONE").Err(); err != nil {
 		log.FromContext(ctx).Error(err, "Failed to promote pod to master", "pod", realMasterPod)
@@ -1173,10 +1254,45 @@ func CreateMasterSlaveReplication(ctx context.Context, client kubernetes.Interfa
 
 	for i := 0; i < len(masterPods); i++ {
 		if masterPods[i] != realMasterPod {
-			redisClient := configureRedisReplicationClient(ctx, client, cr, masterPods[i])
+			redisClient := makeClient(masterPods[i])
 			defer redisClient.Close()
+			// Only issue SLAVEOF when it would actually CHANGE something.
+			//
+			// This function is called on every reconcile of every RedisReplication CR (the
+			// continuous-enforcement path, cf1d993e), and one operator reconciles hundreds of
+			// namespaces. Re-pointing a replica at the master it is already attached to is a no-op
+			// for replication, but redis/valkey logs it at NOTICE every single time:
+			//     "REPLICAOF would result into synchronization with the master we are already
+			//      connected with. No operation performed."
+			// which floods the replica log and masks genuine replication errors (apexportal #28698).
+			//
+			// The enforcement guarantee is unchanged: a replica whose master_host/master_port
+			// DIFFER (a recycled Pod IP, a Sentinel-written IP, `replicaof <self>`) still gets
+			// re-stitched, and an unreadable INFO probe falls through to issuing the command.
+			// Re-issuing toward the SAME address is not a repair either way — redis short-circuits
+			// it before touching the link — so nothing that used to be fixed here stops being fixed.
+			// That includes a replica sitting at master_link_status:down on the RIGHT master:
+			// server.primary_host is set, so valkey short-circuited the re-issue before this change
+			// too; the link is recovered by the replication cron re-resolving the DNS name.
+			//
+			// TWO KNOWN CONSEQUENCES, neither claimed as an improvement:
+			//   * On the failure path this costs an extra round trip — an INFO timeout AND then a
+			//     SLAVEOF timeout where there used to be one. Bounded in practice: the controller
+			//     calls this only after redisNodesByRole has already probed every pod, and that
+			//     returns an error (aborting the reconcile) if any probe fails, so an unreachable
+			//     replica normally never reaches this loop. The residue is a pod that fails between
+			//     the two, on a reconcile that was going to requeue anyway.
+			//   * A replica mid-FAILOVER used to answer "REPLICAOF not allowed while failing over"
+			//     (replication.c checks failover_state BEFORE the already-connected short-circuit),
+			//     which surfaced as a failed reconcile. Now the skip happens first and that error is
+			//     no longer raised for an already-attached replica.
+			if isAlreadyReplicaOf(ctx, redisClient, masterPods[i], realMasterAddr, redisReplicationPort) {
+				log.FromContext(ctx).V(1).Info("Pod is already replicating from the elected master; skipping SLAVEOF",
+					"pod", masterPods[i], "masterAddr", realMasterAddr)
+				continue
+			}
 			log.FromContext(ctx).V(1).Info("Setting the", "pod", masterPods[i], "to slave of", realMasterPod, "masterAddr", realMasterAddr)
-			err := redisClient.SlaveOf(ctx, realMasterAddr, "6379").Err()
+			err := redisClient.SlaveOf(ctx, realMasterAddr, redisReplicationPort).Err()
 			if err != nil {
 				log.FromContext(ctx).Error(err, "Failed to set", "pod", masterPods[i], "to slave of", realMasterPod, "masterAddr", realMasterAddr)
 				return err
