@@ -4,9 +4,14 @@ import (
 	"context"
 	"testing"
 
+	rrvb2 "github.com/OT-CONTAINER-KIT/redis-operator/api/redisreplication/v1beta2"
 	"github.com/go-redis/redismock/v9"
 	redis "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	k8sClientFake "k8s.io/client-go/kubernetes/fake"
 )
 
 // Captured from a real valkey 8 replica in this fleet (INFO Replication), trimmed to the fields
@@ -59,6 +64,9 @@ func Test_parseReplicationTarget(t *testing.T) {
 			wantKnown: true,
 		},
 		{
+			// SYNTHESIZED, not observed: valkey emits master_host and master_port from the same
+			// FMTARGS block inside `if (server.primary_host)`, so a real replica always has both
+			// and a real master has neither. Kept as defensive coverage of the `known` conjunction.
 			name:      "truncated info carrying only the host",
 			info:      "# Replication\r\nrole:slave\r\nmaster_host:valkey-0.valkey-headless.ns.svc.cluster.local\r\n",
 			wantHost:  "valkey-0.valkey-headless.ns.svc.cluster.local",
@@ -179,4 +187,95 @@ func Test_isAlreadyReplicaOf(t *testing.T) {
 		assert.False(t, isAlreadyReplicaOf(context.TODO(), client, "valkey-1", wantAddr, redisReplicationPort))
 		assert.NoError(t, mock.ExpectationsWereMet())
 	})
+}
+
+// --- call-site tests -------------------------------------------------------------------------
+//
+// These drive createMasterSlaveReplication itself, because the helper tests above CANNOT fail if
+// the guard is removed from the loop: the fix is the `continue`, not the predicate. Verified by
+// mutation — deleting the skip block leaves every helper test green and turns these red.
+//
+// redismock asserts on the ORDER and SET of commands, so "no SLAVEOF was issued" is expressed by
+// simply not expecting one: an unexpected command fails the call and ExpectationsWereMet reports
+// anything expected-but-unsent.
+
+const masterFQDN = "valkey-0.valkey-headless.default.svc.cluster.local"
+
+// replicaAttachedTo renders the INFO Replication payload of a replica following host:6379.
+func replicaAttachedTo(host string) string {
+	return "# Replication\r\nrole:slave\r\n" +
+		"master_host:" + host + "\r\nmaster_port:6379\r\n" +
+		"master_link_status:up\r\nslave_read_only:1\r\n"
+}
+
+// newReplicationFixture wires a fake clientset holding a running pod per name (so
+// getRedisServerIP resolves) and one redismock per pod, keyed by pod name.
+func newReplicationFixture(t *testing.T, podNames ...string) (*rrvb2.RedisReplication, *k8sClientFake.Clientset, map[string]redismock.ClientMock, func(string) *redis.Client) {
+	t.Helper()
+	objs := []runtime.Object{}
+	for _, n := range podNames {
+		objs = append(objs, &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: n, Namespace: "default"},
+			Status:     corev1.PodStatus{PodIP: "192.168.1.1", Phase: corev1.PodRunning},
+		})
+	}
+	k8s := k8sClientFake.NewSimpleClientset(objs...)
+	cr := &rrvb2.RedisReplication{ObjectMeta: metav1.ObjectMeta{Name: "valkey", Namespace: "default"}}
+
+	mocks := map[string]redismock.ClientMock{}
+	clients := map[string]*redis.Client{}
+	for _, n := range podNames {
+		c, m := redismock.NewClientMock()
+		mocks[n], clients[n] = m, c
+	}
+	return cr, k8s, mocks, func(podName string) *redis.Client { return clients[podName] }
+}
+
+func TestCreateMasterSlaveReplication_skipsRedundantReplicaof(t *testing.T) {
+	cr, k8s, mocks, makeClient := newReplicationFixture(t, "valkey-0", "valkey-1")
+
+	// The elected master is promoted unconditionally (see the comment on that call: gating it
+	// would suppress no log line and would make the total-master-loss path conditional).
+	mocks["valkey-0"].ExpectSlaveOf("NO", "ONE").SetVal("OK")
+	// valkey-1 is ALREADY following valkey-0 -> INFO only, and deliberately NO ExpectSlaveOf.
+	mocks["valkey-1"].ExpectInfo("Replication").SetVal(replicaAttachedTo(masterFQDN))
+
+	err := createMasterSlaveReplication(context.TODO(), k8s, cr, []string{"valkey-0", "valkey-1"}, "valkey-0", makeClient)
+
+	assert.NoError(t, err)
+	for name, m := range mocks {
+		assert.NoError(t, m.ExpectationsWereMet(), "unmet expectations on %s", name)
+	}
+}
+
+func TestCreateMasterSlaveReplication_restitchesDriftedReplica(t *testing.T) {
+	cr, k8s, mocks, makeClient := newReplicationFixture(t, "valkey-0", "valkey-1")
+
+	mocks["valkey-0"].ExpectSlaveOf("NO", "ONE").SetVal("OK")
+	// Stranded on a recycled pod IP -> the enforcement this operator carries MUST still fire.
+	mocks["valkey-1"].ExpectInfo("Replication").SetVal(replicaAttachedTo("10.244.3.17"))
+	mocks["valkey-1"].ExpectSlaveOf(masterFQDN, "6379").SetVal("OK")
+
+	err := createMasterSlaveReplication(context.TODO(), k8s, cr, []string{"valkey-0", "valkey-1"}, "valkey-0", makeClient)
+
+	assert.NoError(t, err)
+	for name, m := range mocks {
+		assert.NoError(t, m.ExpectationsWereMet(), "unmet expectations on %s", name)
+	}
+}
+
+func TestCreateMasterSlaveReplication_failsOpenOnUnreadableInfo(t *testing.T) {
+	cr, k8s, mocks, makeClient := newReplicationFixture(t, "valkey-0", "valkey-1")
+
+	mocks["valkey-0"].ExpectSlaveOf("NO", "ONE").SetVal("OK")
+	// An unreadable probe must degrade to the PRE-GUARD behaviour, never to skipping a repair.
+	mocks["valkey-1"].ExpectInfo("Replication").SetErr(redis.ErrClosed)
+	mocks["valkey-1"].ExpectSlaveOf(masterFQDN, "6379").SetVal("OK")
+
+	err := createMasterSlaveReplication(context.TODO(), k8s, cr, []string{"valkey-0", "valkey-1"}, "valkey-0", makeClient)
+
+	assert.NoError(t, err)
+	for name, m := range mocks {
+		assert.NoError(t, m.ExpectationsWereMet(), "unmet expectations on %s", name)
+	}
 }
