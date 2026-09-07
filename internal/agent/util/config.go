@@ -110,7 +110,24 @@ func (c *Config) Commit() error {
 	// and the failure is that it cannot open it at all. Rename needs only WRITE+EXECUTE on the
 	// DIRECTORY, which the config volume grants, so it works regardless of who owns the existing
 	// file — and it is atomic, so a reader never sees a partial config.
-	tmp, err := os.CreateTemp(dir, tempPattern(c.path))
+	return writeConfigFileAtomic(c.path, c.content)
+}
+
+// writeConfigFileAtomic is the write half of Commit(), factored out so EVERY file this package
+// puts into the config directory gets the same treatment — see the Commit() comment above for why
+// truncate-in-place is unsafe here.
+//
+// It exists because it was NOT being reused: upstream's ExpandExternalConfig wrote its
+// `.expanded.conf` beside redis.conf with a plain os.WriteFile(..., 0o644), which is exactly the
+// pattern this fork carries two commits to eliminate. That path is latent today (it is reached
+// only when EXPAND_EXTERNAL_CONFIG is enabled, and it defaults to "false"), and its failure is
+// quieter than the one that motivated the original fix: AppendExternalConfig treats an expand
+// error as non-fatal and includes the file VERBATIM, so `${VAR}` placeholders would reach redis
+// unexpanded rather than crashlooping the pod. Fixing one instance of a class and leaving the
+// other is how the next incident gets rediscovered.
+func writeConfigFileAtomic(path, content string) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, tempPattern(path))
 	if err != nil {
 		return fmt.Errorf("failed to create temp config in %s: %v", dir, err)
 	}
@@ -120,7 +137,7 @@ func (c *Config) Commit() error {
 		_ = os.Remove(tmpName)
 	}()
 
-	if _, err := tmp.WriteString(c.content); err != nil {
+	if _, err := tmp.WriteString(content); err != nil {
 		tmp.Close()
 		return fmt.Errorf("failed to write temp config %s: %v", tmpName, err)
 	}
@@ -134,8 +151,8 @@ func (c *Config) Commit() error {
 	if err := os.Chmod(tmpName, configFileMode); err != nil {
 		return fmt.Errorf("failed to chmod temp config %s: %v", tmpName, err)
 	}
-	if err := os.Rename(tmpName, c.path); err != nil {
-		return fmt.Errorf("failed to rename %s to %s: %v", tmpName, c.path, err)
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("failed to rename %s to %s: %v", tmpName, path, err)
 	}
 	return nil
 }
@@ -167,7 +184,7 @@ func ExpandExternalConfig(externalConfigFile, confPath string) (string, error) {
 
 	base := strings.TrimSuffix(filepath.Base(externalConfigFile), ".conf")
 	expandedFile := filepath.Join(filepath.Dir(confPath), base+".expanded.conf")
-	if err := os.WriteFile(expandedFile, []byte(expanded), 0o644); err != nil {
+	if err := writeConfigFileAtomic(expandedFile, expanded); err != nil {
 		return "", fmt.Errorf("write expanded config to %s: %v", expandedFile, err)
 	}
 	return expandedFile, nil

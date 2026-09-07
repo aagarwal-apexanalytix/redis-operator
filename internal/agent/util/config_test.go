@@ -382,3 +382,43 @@ func TestCommitOnRedisPathLeavesOnlyTheTarget(t *testing.T) {
 		t.Errorf("expected only redis.conf, got %d entries", len(entries))
 	}
 }
+
+// TestExpandExternalConfigReplacesAFileItCannotWrite pins the F1 fix: ExpandExternalConfig writes
+// into the SAME directory as redis.conf, and on an init-container re-run the file already sitting
+// at that path may be owned by another uid (the emptyDir survives pod-sandbox recreation while the
+// running uid can change between deployments). os.WriteFile opens O_TRUNC, which needs write
+// permission on the EXISTING file; rename needs only write+execute on the DIRECTORY.
+//
+// A 0444 file reproduces that without needing a second uid: O_WRONLY on a read-only file fails
+// with EACCES even for its owner. Reverting the body to os.WriteFile(..., 0o644) fails this test.
+func TestExpandExternalConfigReplacesAFileItCannotWrite(t *testing.T) {
+	dir := t.TempDir()
+	externalPath := filepath.Join(dir, "redis-additional.conf")
+	confPath := filepath.Join(dir, "redis.conf")
+	if err := os.WriteFile(externalPath, []byte("maxmemory-policy ${TEST_EVICTION}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_EVICTION", "allkeys-lru")
+
+	// Pre-create the target as an unwritable file, as a previous run under a different uid would.
+	expandedPath := filepath.Join(dir, "redis-additional.expanded.conf")
+	if err := os.WriteFile(expandedPath, []byte("stale\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := ExpandExternalConfig(externalPath, confPath)
+	if err != nil {
+		t.Fatalf("expand over an unwritable existing file failed: %v", err)
+	}
+	if out != expandedPath {
+		t.Fatalf("expanded path = %q, want %q", out, expandedPath)
+	}
+	raw, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw); got != "maxmemory-policy allkeys-lru\n" {
+		t.Fatalf("content = %q, want the expanded value (stale content means the write was skipped)", got)
+	}
+	assertWritableByNonOwner(t, out, "expanded config")
+}

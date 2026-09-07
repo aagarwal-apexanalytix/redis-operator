@@ -607,7 +607,7 @@ func (r *Reconciler) reconcileRedis(ctx context.Context, instance *rrvb2.RedisRe
 		if incompleteTopology {
 			log.FromContext(ctx).Info("Skipping replica promotion because the observed topology is incomplete",
 				"observedPods", observedPods,
-				"expectedPods", *instance.Spec.Size)
+				"unobservedPods", topology.Unobserved)
 		} else {
 			realMaster = slaveNodes[0]
 			if instance.Status.MasterNode != "" &&

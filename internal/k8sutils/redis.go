@@ -1230,11 +1230,14 @@ func createMasterSlaveReplication(ctx context.Context, client kubernetes.Interfa
 			//
 			// TWO KNOWN CONSEQUENCES, neither claimed as an improvement:
 			//   * On the failure path this costs an extra round trip — an INFO timeout AND then a
-			//     SLAVEOF timeout where there used to be one. Bounded in practice: the controller
-			//     calls this only after redisNodesByRole has already probed every pod, and that
-			//     returns an error (aborting the reconcile) if any probe fails, so an unreachable
-			//     replica normally never reaches this loop. The residue is a pod that fails between
-			//     the two, on a reconcile that was going to requeue anyway.
+			//     SLAVEOF timeout where there used to be one. Still bounded, but NOT by the
+			//     mechanism this comment used to claim: getRedisReplicationTopology (upstream
+			//     04f98953) no longer aborts the reconcile when a probe fails — it records the pod
+			//     in topology.Unobserved and carries on. The bound now comes from the CALLERS:
+			//     every createRedisReplicationLink site is gated on !incompleteTopology, and an
+			//     Unobserved pod never appears in the lists passed down, so an unreachable replica
+			//     still does not reach this loop. The residue is a pod that fails between the
+			//     topology read and this call, on a reconcile that was going to requeue anyway.
 			//   * A replica mid-FAILOVER used to answer "REPLICAOF not allowed while failing over"
 			//     (replication.c checks failover_state BEFORE the already-connected short-circuit),
 			//     which surfaced as a failed reconcile. Now the skip happens first and that error is
