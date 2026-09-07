@@ -293,15 +293,31 @@ func TestReconcileRedisAttachesReturningMasterUnderTheMasterSentinelMonitors(t *
 }
 
 // With every pod observed a lone master is conclusive on its own.
+//
+// FORK DIVERGENCE — do not "fix" this back on a future rebase. Upstream wraps the lone-master
+// enforcement in `currentRealMaster == "" && !instance.EnableSentinel()`, so with sentinel ENABLED
+// (as here, and as on the whole apexanalytix fleet) it never re-stitches and this test needed no
+// CreateRedisReplicationLink hook at all. Fork commit cf1d993e removes that gate deliberately:
+// Sentinel only reconfigures replicas during a FAILOVER, so a replica that drifted off a
+// still-live master is repaired by neither layer. Enforcement therefore now RUNS here, and the
+// hook has to be injected — without it the call falls through to the real
+// k8sutils.CreateMasterSlaveReplication against a fake clientset and the reconcile requeues.
 func TestReconcileRedisConfiguresSentinelForLoneMasterWhenTopologyIsComplete(t *testing.T) {
 	sentinelCalled := false
+	linkCalled := false
 	var gotMaster string
+	var gotLinkPods []string
 	r := &Reconciler{
 		StatefulSet:              &fakeStatefulSetService{},
 		K8sClient:                fake.NewSimpleClientset(),
 		RedisReplicationTopology: topologyOf([]string{"example-replication-1"}, []string{"example-replication-0", "example-replication-2"}, nil),
 		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
 			return ""
+		},
+		CreateRedisReplicationLink: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, pods []string, _ string) error {
+			linkCalled = true
+			gotLinkPods = append([]string{}, pods...)
+			return nil
 		},
 		ConfigureSentinel: func(_ context.Context, _ *rrvb2.RedisReplication, master string) error {
 			sentinelCalled = true
@@ -316,6 +332,12 @@ func TestReconcileRedisConfiguresSentinelForLoneMasterWhenTopologyIsComplete(t *
 	assert.Equal(t, ctrl.Result{}, result)
 	assert.True(t, sentinelCalled)
 	assert.Equal(t, "example-replication-1", gotMaster)
+	// The fork's continuous enforcement: it runs even with sentinel enabled, over every observed
+	// pod, which is precisely what upstream's gate suppresses.
+	assert.True(t, linkCalled, "fork enforces the master-slave stitch even when sentinel is enabled")
+	assert.ElementsMatch(t,
+		[]string{"example-replication-1", "example-replication-0", "example-replication-2"},
+		gotLinkPods)
 }
 
 // Every pod answered and every one of them is a replica: there is no master,
@@ -1147,12 +1169,12 @@ func TestReconcileRedisElectsMasterWhenSplitBrainHasOnlyOrphanedReplicas(t *test
 	var gotMaster string
 	r := &Reconciler{
 		K8sClient: fake.NewSimpleClientset(),
-		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
-			if role == "master" {
-				return []string{"example-replication-0", "example-replication-1"}, nil
-			}
+		RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
 			// self-reports slave, but no master has it attached (RealMaster below returns "")
-			return []string{"example-replication-2"}, nil
+			return k8sutils.RedisReplicationTopology{
+				Masters: []string{"example-replication-0", "example-replication-1"},
+				Slaves:  []string{"example-replication-2"},
+			}, nil
 		},
 		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
 			return "" // no master has connected_slaves > 0
@@ -1185,12 +1207,15 @@ func TestReconcileRedisStillSkipsWhenTopologyIncompleteWithOrphanedReplica(t *te
 	createCalled := false
 	r := &Reconciler{
 		K8sClient: fake.NewSimpleClientset(),
-		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
-			if role == "master" {
-				return []string{"example-replication-0", "example-replication-1"}, nil
-			}
-			// An orphaned replica IS present, but only 3 of the 4 expected pods are observed.
-			return []string{"example-replication-2"}, nil
+		RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
+			// An orphaned replica IS present, but one pod could not be observed.
+			return k8sutils.RedisReplicationTopology{
+				Masters: []string{"example-replication-0", "example-replication-1"},
+				Slaves:  []string{"example-replication-2"},
+				// Unobserved is what makes Complete() false now; the old tests expressed
+				// incompleteness as observedPods < Spec.Size (upstream 04f98953 changed this).
+				Unobserved: []string{"example-replication-3"},
+			}, nil
 		},
 		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
 			return ""
@@ -1226,11 +1251,11 @@ func TestReconcileRedisNeverElectsAStaleStatusMasterThatIsNowASlave(t *testing.T
 			ObjectMeta: metav1.ObjectMeta{Name: "example-replication-2", Namespace: "default"},
 			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 		}),
-		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
-			if role == "master" {
-				return []string{"example-replication-0", "example-replication-1"}, nil
-			}
-			return []string{"example-replication-2"}, nil
+		RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
+			return k8sutils.RedisReplicationTopology{
+				Masters: []string{"example-replication-0", "example-replication-1"},
+				Slaves:  []string{"example-replication-2"},
+			}, nil
 		},
 		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
 			return ""
@@ -1267,11 +1292,11 @@ func TestReconcileRedisAbstainsWhenAttachedReplicaCountsAreUnreadable(t *testing
 	createCalled := false
 	r := &Reconciler{
 		K8sClient: fake.NewSimpleClientset(),
-		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
-			if role == "master" {
-				return []string{"example-replication-0", "example-replication-1"}, nil
-			}
-			return []string{"example-replication-2"}, nil
+		RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
+			return k8sutils.RedisReplicationTopology{
+				Masters: []string{"example-replication-0", "example-replication-1"},
+				Slaves:  []string{"example-replication-2"},
+			}, nil
 		},
 		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
 			return "" // could mean "no replicas" OR "probe failed"
@@ -1301,11 +1326,12 @@ func TestReconcileRedisPromotesAReplicaWhenNoMasterRemains(t *testing.T) {
 	var gotMaster string
 	r := &Reconciler{
 		K8sClient: fake.NewSimpleClientset(),
-		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
-			if role == "master" {
-				return nil, nil // NOBODY is a master
-			}
-			return []string{"example-replication-0", "example-replication-1", "example-replication-2"}, nil
+		RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
+			// NOBODY is a master
+			return k8sutils.RedisReplicationTopology{
+				Masters: nil,
+				Slaves:  []string{"example-replication-0", "example-replication-1", "example-replication-2"},
+			}, nil
 		},
 		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
 			return ""
@@ -1336,11 +1362,12 @@ func TestReconcileRedisIgnoresStaleStatusMasterNotAmongReplicas(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Name: "example-replication-9", Namespace: "default"},
 			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 		}),
-		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
-			if role == "master" {
-				return nil, nil
-			}
-			return []string{"example-replication-0", "example-replication-1", "example-replication-2"}, nil
+		RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
+			// NOBODY is a master
+			return k8sutils.RedisReplicationTopology{
+				Masters: nil,
+				Slaves:  []string{"example-replication-0", "example-replication-1", "example-replication-2"},
+			}, nil
 		},
 		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
 			return ""
@@ -1366,11 +1393,15 @@ func TestReconcileRedisDoesNotPromoteOnIncompleteTopology(t *testing.T) {
 	createCalled := false
 	r := &Reconciler{
 		K8sClient: fake.NewSimpleClientset(),
-		RedisNodesByRole: func(_ context.Context, _ kubernetes.Interface, _ *rrvb2.RedisReplication, role string) ([]string, error) {
-			if role == "master" {
-				return nil, nil
-			}
-			return []string{"example-replication-0"}, nil // only 1 of 3 observed
+		RedisReplicationTopology: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication) (k8sutils.RedisReplicationTopology, error) {
+			// only 1 of 3 observed
+			return k8sutils.RedisReplicationTopology{
+				Masters: nil,
+				Slaves:  []string{"example-replication-0"},
+				// Unobserved is what makes Complete() false now; the old tests expressed
+				// incompleteness as observedPods < Spec.Size (upstream 04f98953 changed this).
+				Unobserved: []string{"example-replication-1", "example-replication-2"},
+			}, nil
 		},
 		RedisReplicationRealMaster: func(context.Context, kubernetes.Interface, *rrvb2.RedisReplication, []string) string {
 			return ""
