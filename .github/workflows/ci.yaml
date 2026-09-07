@@ -6,6 +6,17 @@ on:
   # push:
   #   branches:
   #     - main
+  # Manual trigger. Added 2026-09-07 because GitHub stopped delivering `pull_request` events for
+  # this fork: PR #10 got no CI at all across four separate triggers (opened, two synchronize
+  # pushes, and close+reopen), with Actions enabled, every workflow `active`, the repo public and
+  # not archived, and `check-runs total_count = 0`. With no way to run CI, the E2E suite — the only
+  # gate here that exercises a real cluster — could not be obtained for a rebase that restructures
+  # the reconcile loop.
+  #
+  # NOTE for anyone adding this elsewhere: `workflow_dispatch` is only offered once the workflow
+  # carrying it exists on the DEFAULT branch. Adding it on a feature branch alone does nothing;
+  # that is why this lands on main first and is then dispatched AGAINST the branch under test.
+  workflow_dispatch:
 
 permissions:
   contents: read
