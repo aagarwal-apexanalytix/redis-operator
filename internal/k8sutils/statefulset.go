@@ -160,6 +160,11 @@ type containerParameters struct {
 	// "replication" role and for every RedisCluster leader and follower, and
 	// bounds the demotion wait in whichever preStop hook is installed.
 	PreStopWaitSeconds int
+	// SentinelReadinessRequiresMaster makes the generated sentinel readiness probe
+	// also require a real monitored master (see getSentinelReadinessProbe). Set only
+	// for a RedisSentinel whose master the operator manages, i.e. one that has
+	// RedisSentinelConfig: nothing else would ever replace a bootstrap placeholder.
+	SentinelReadinessRequiresMaster bool
 }
 
 type initContainerParameters struct {
@@ -533,7 +538,7 @@ func generateContainerDef(name string, containerParams containerParameters, clus
 				containerParams.Resources,
 				containerParams.MaxMemoryPercentOfLimit,
 			),
-			ReadinessProbe: getProbeInfo(containerParams.ReadinessProbe, sentinelCntr, enableTLS),
+			ReadinessProbe: getReadinessProbe(containerParams, sentinelCntr, enableTLS),
 			LivenessProbe:  getProbeInfo(containerParams.LivenessProbe, sentinelCntr, enableTLS),
 			VolumeMounts:   getVolumeMount(name, containerParams.PersistenceEnabled, clusterMode, nodeConfVolume, externalConfig, mountpath, containerParams.TLSConfig, containerParams.ACLConfig),
 		},
@@ -1086,35 +1091,90 @@ func getVolumeMount(name string, persistenceEnabled *bool, clusterMode bool, nod
 }
 
 // getProbeInfo generate probe for Redis StatefulSet
+func getProbeInfo(probe *corev1.Probe, sentinel, enableTLS bool) *corev1.Probe {
+	return withDefaultProbeHandler(probe, pingCheckScript(sentinel, enableTLS))
+}
+
+// getReadinessProbe returns the readiness probe for a generated container. It is the PING
+// probe of getProbeInfo, except for a sentinel whose master the operator manages, which gets
+// getSentinelReadinessProbe. The liveness probe stays PING-only for every role.
+func getReadinessProbe(containerParams containerParameters, sentinel, enableTLS bool) *corev1.Probe {
+	if sentinel && containerParams.SentinelReadinessRequiresMaster {
+		return getSentinelReadinessProbe(containerParams.ReadinessProbe, enableTLS)
+	}
+	return getProbeInfo(containerParams.ReadinessProbe, sentinel, enableTLS)
+}
+
+// getSentinelReadinessProbe generates a sentinel readiness probe that fails until the
+// sentinel reports a real monitored master.
+//
+// A sentinel that cannot learn its master from a peer at bootstrap starts out monitoring the
+// placeholder 0.0.0.0 (see the sentinel bootstrap in internal/agent) and answers
+// `SENTINEL get-master-addr-by-name` with it until the operator issues SENTINEL MONITOR. A
+// PING-only probe reports that sentinel Ready, so an OrderedReady rolling update moves on to
+// the next sentinel. Once every sentinel has been replaced that way, none of them knows the
+// master, clients are handed 0.0.0.0, and nothing is left to gossip the real master from.
+// Holding readiness back until the master is real makes the roll wait for each sentinel, and
+// keeps a placeholder sentinel out of the sentinel Service while it waits.
+//
+// Only readiness carries the check. Liveness stays PING-only so a sentinel waiting for the
+// operator is not restarted, which would only start the wait over.
+func getSentinelReadinessProbe(probe *corev1.Probe, enableTLS bool) *corev1.Probe {
+	return withDefaultProbeHandler(probe, pingCheckScript(true, enableTLS)+"\n"+sentinelKnowsMasterCheck(enableTLS))
+}
+
+// sentinelKnowsMasterCheck is a shell fragment that fails unless the local sentinel answers
+// `SENTINEL get-master-addr-by-name` with exactly a host and a numeric port, and the host is
+// not the bootstrap placeholder. redis-cli exits 0 and prints the reply on stdout for an
+// error reply too (e.g. "ERR ..." or "NOAUTH ..."), and prints nothing for a master it does
+// not monitor, so the reply's shape is checked rather than the exit status alone.
+func sentinelKnowsMasterCheck(enableTLS bool) string {
+	return strings.Join([]string{
+		"MASTER=\"$(" + redisCLIProbeCommand(true, enableTLS) + " sentinel get-master-addr-by-name \"${MASTER_GROUP_NAME:-mymaster}\")\"",
+		"set -f",
+		"set -- $MASTER",
+		"[ \"$#\" -eq 2 ]",
+		"case \"$2\" in ''|*[!0-9]*) exit 1 ;; esac",
+		"[ \"$1\" != \"0.0.0.0\" ]",
+	}, "\n")
+}
+
+// pingCheckScript is the shell script of the default PING probe.
 // The `ping` command will exit successfully even if the node is loading,
 // so we need to verify that the Redis `ping` command returns "PONG".
-func getProbeInfo(probe *corev1.Probe, sentinel, enableTLS bool) *corev1.Probe {
+func pingCheckScript(sentinel, enableTLS bool) string {
+	return redisCLIAuthSanitizer + "\n" + "RESP=\"$(" + redisCLIProbeCommand(sentinel, enableTLS) + " ping)\"\n" + "[ \"$RESP\" = \"PONG\" ]"
+}
+
+// redisCLIProbeCommand is the redis-cli invocation, without a command, that the generated
+// probes run against the local server.
+func redisCLIProbeCommand(sentinel, enableTLS bool) string {
+	redisHealthCheck := []string{
+		"redis-cli",
+		"-h", "$(hostname)",
+	}
+	if sentinel {
+		redisHealthCheck = append(redisHealthCheck, "-p", "${SENTINEL_PORT}")
+	} else {
+		redisHealthCheck = append(redisHealthCheck, "-p", "${REDIS_PORT}")
+	}
+	if enableTLS {
+		redisHealthCheck = append(redisHealthCheck, "--tls", "--cert", "${REDIS_TLS_CERT}", "--key", "${REDIS_TLS_CERT_KEY}", "${REDIS_TLS_CA_CERT:+--cacert}", "${REDIS_TLS_CA_CERT}")
+	}
+	return strings.Join(redisHealthCheck, " ")
+}
+
+// withDefaultProbeHandler sets script as the probe's handler unless the CR already supplied
+// one, which is always left untouched.
+func withDefaultProbeHandler(probe *corev1.Probe, script string) *corev1.Probe {
 	if probe == nil {
 		probe = &corev1.Probe{}
 	}
 	if probe.Exec == nil && probe.HTTPGet == nil && probe.TCPSocket == nil && probe.GRPC == nil {
-		redisHealthCheck := []string{
-			"redis-cli",
-			"-h", "$(hostname)",
-		}
-		if sentinel {
-			redisHealthCheck = append(redisHealthCheck, "-p", "${SENTINEL_PORT}")
-		} else {
-			redisHealthCheck = append(redisHealthCheck, "-p", "${REDIS_PORT}")
-		}
-		if enableTLS {
-			redisHealthCheck = append(redisHealthCheck, "--tls", "--cert", "${REDIS_TLS_CERT}", "--key", "${REDIS_TLS_CERT_KEY}", "${REDIS_TLS_CA_CERT:+--cacert}", "${REDIS_TLS_CA_CERT}")
-		}
-		redisHealthCheck = append(redisHealthCheck, "ping")
-
-		redisHealthCheckSubshell := strings.Join(redisHealthCheck, " ")
-
-		healthCheckScript := redisCLIAuthSanitizer + "\n" + "RESP=\"$(" + redisHealthCheckSubshell + ")\"\n" + "[ \"$RESP\" = \"PONG\" ]"
-
 		// `-e` causes the shell to exit immediately if a (nontested) command fails
 		probe.ProbeHandler = corev1.ProbeHandler{
 			Exec: &corev1.ExecAction{
-				Command: []string{"sh", "-ec", healthCheckScript},
+				Command: []string{"sh", "-ec", script},
 			},
 		}
 	}
