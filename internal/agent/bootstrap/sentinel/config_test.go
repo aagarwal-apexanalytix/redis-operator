@@ -3,6 +3,7 @@ package bootstrap
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -214,3 +215,118 @@ func Test_GenerateConfig_ExternalConfig_MissingVarBecomesEmpty(t *testing.T) {
 	assert.NotContains(t, string(includedRaw), "${NOT_SET_VAR}")
 	assert.Contains(t, string(includedRaw), "loglevel \n")
 }
+
+// Test_GenerateConfig_MonitorLineFromPeers covers how the `sentinel monitor` line is chosen:
+// an explicit IP env wins and skips the lookup; otherwise the peer sentinels' master is used;
+// and when the lookup cannot answer (or TLS rules it out) the placeholder is written, which is
+// the only line Sentinel accepts before its per-master directives when no master is known.
+func Test_GenerateConfig_MonitorLineFromPeers(t *testing.T) {
+	peerMaster := monitoredMaster{host: "10.0.1.10", port: "6380", configEpoch: 2}
+
+	tests := []struct {
+		name             string
+		ip               *string
+		tls              bool
+		resolveHostnames string
+		lookupErr        error
+		wantLookup       bool
+		wantMonitor      string
+	}{
+		{
+			name:        "IP unset: boots on the master the peers follow",
+			wantLookup:  true,
+			wantMonitor: "sentinel monitor master 10.0.1.10 6380 2",
+		},
+		{
+			name:        "IP is the placeholder: boots on the master the peers follow",
+			ip:          ptr("0.0.0.0"),
+			wantLookup:  true,
+			wantMonitor: "sentinel monitor master 10.0.1.10 6380 2",
+		},
+		{
+			name:        "IP set: used as-is, peers are not asked",
+			ip:          ptr("10.1.1.1"),
+			wantLookup:  false,
+			wantMonitor: "sentinel monitor master 10.1.1.1 6379 2",
+		},
+		{
+			name:        "lookup fails: placeholder, as before the lookup existed",
+			lookupErr:   errNoUsableAnswer,
+			wantLookup:  true,
+			wantMonitor: "sentinel monitor master 0.0.0.0 6379 2",
+		},
+		{
+			name:        "TLS: peers are not asked (no TLS material in the init container)",
+			tls:         true,
+			wantLookup:  false,
+			wantMonitor: "sentinel monitor master 0.0.0.0 6379 2",
+		},
+		{
+			name:             "resolve-hostnames yes lets the lookup accept a hostname master",
+			resolveHostnames: "yes",
+			wantLookup:       true,
+			wantMonitor:      "sentinel monitor master 10.0.1.10 6380 2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			type call struct {
+				group, sentinelPort, password string
+				allowHostname                 bool
+			}
+			var calls []call
+			orig := discoverPeerMaster
+			discoverPeerMaster = func(group, sentinelPort, password string, allowHostname bool) (monitoredMaster, error) {
+				calls = append(calls, call{group, sentinelPort, password, allowHostname})
+				if tt.lookupErr != nil {
+					return monitoredMaster{}, tt.lookupErr
+				}
+				return peerMaster, nil
+			}
+			t.Cleanup(func() { discoverPeerMaster = orig })
+
+			confPath := filepath.Join(t.TempDir(), "sentinel.conf")
+			t.Setenv("SENTINEL_CONFIG_FILE", confPath)
+			t.Setenv("MASTER_GROUP_NAME", "master")
+			t.Setenv("PORT", "6379")
+			t.Setenv("QUORUM", "2")
+			t.Setenv("SENTINEL_PORT", "26379")
+			t.Setenv("REDIS_PASSWORD", "pw")
+			t.Setenv("RESOLVE_HOSTNAMES", tt.resolveHostnames)
+			t.Setenv("ANNOUNCE_HOSTNAMES", "no")
+			if tt.ip != nil {
+				t.Setenv("IP", *tt.ip)
+			} else {
+				t.Setenv("IP", "")
+			}
+			if tt.tls {
+				t.Setenv("TLS_MODE", "true")
+				t.Setenv("REDIS_TLS_CERT", "/tls/tls.crt")
+				t.Setenv("REDIS_TLS_CERT_KEY", "/tls/tls.key")
+			} else {
+				t.Setenv("TLS_MODE", "")
+			}
+
+			require.NoError(t, GenerateConfig())
+
+			raw, err := os.ReadFile(confPath)
+			require.NoError(t, err)
+			conf := string(raw)
+
+			assert.Contains(t, conf, "\n"+tt.wantMonitor+"\n")
+			assert.Equal(t, 1, strings.Count(conf, "\nsentinel monitor "), "exactly one monitor line")
+			// The per-master directives Sentinel rejects without a monitor line are still there.
+			assert.Contains(t, conf, "\nsentinel down-after-milliseconds master ")
+
+			if !tt.wantLookup {
+				assert.Empty(t, calls, "peers must not be asked")
+				return
+			}
+			require.Len(t, calls, 1)
+			assert.Equal(t, call{"master", "26379", "pw", tt.resolveHostnames == "yes"}, calls[0])
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
