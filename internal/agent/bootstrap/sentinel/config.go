@@ -62,7 +62,7 @@ func GenerateConfig() error {
 	// sentinel_mode_setup
 	{
 		masterGroupName, _ := util.CoalesceEnv("MASTER_GROUP_NAME", "mymaster")
-		ip, _ := util.CoalesceEnv("IP", "0.0.0.0")
+		ip, _ := util.CoalesceEnv("IP", "")
 		port, _ := util.CoalesceEnv("PORT", "6379")
 		quorum, _ := util.CoalesceEnv("QUORUM", "2")
 		downAfterMilliseconds, _ := util.CoalesceEnv("DOWN_AFTER_MILLISECONDS", "30000")
@@ -71,6 +71,9 @@ func GenerateConfig() error {
 		resolveHostnames, _ := util.CoalesceEnv("RESOLVE_HOSTNAMES", "no")
 		announceHostnames, _ := util.CoalesceEnv("ANNOUNCE_HOSTNAMES", "no")
 
+		if ip == "" || ip == placeholderMasterHost {
+			ip, port = bootstrapMonitorAddress(masterGroupName, port, resolveHostnames == "yes")
+		}
 		cfg.Append("sentinel monitor", masterGroupName, ip, port, quorum)
 		cfg.Append("sentinel down-after-milliseconds", masterGroupName, downAfterMilliseconds)
 		cfg.Append("sentinel parallel-syncs", masterGroupName, parallelSyncs)
@@ -92,9 +95,6 @@ func GenerateConfig() error {
 		}
 
 		// If resolveHostnames is set to yes, then we need to announce the hostnames.
-		// Note the pre-existing `sentinel monitor` line above still renders the
-		// unset IP env as 0.0.0.0; the operator repairs it with SENTINEL MONITOR
-		// once it knows the master. See #1806.
 		if announceHostnames == "yes" && resolveHostnames == "yes" {
 			if fqdnName, err := announceHostname(); err != nil {
 				log.Printf("Warning: Failed to get FQDN for sentinel announce-ip: %v", err)
@@ -156,4 +156,28 @@ func GenerateConfig() error {
 
 	fmt.Println("Starting sentinel service .....")
 	return nil
+}
+
+// bootstrapMonitorAddress picks the master for the `sentinel monitor` line when the IP env
+// gives none. It asks the peer sentinels first, so a sentinel restarted while its peers are
+// healthy boots on the master they already follow and never advertises the placeholder. When
+// no peer can answer (the first sentinel of a new deployment, every sentinel restarted at
+// once, TLS, or a lookup failure) it returns the placeholder, and the operator's next
+// SENTINEL MONITOR sets the real master, as it always has.
+func bootstrapMonitorAddress(masterGroupName, port string, allowHostname bool) (string, string) {
+	if tlsMode, _ := util.CoalesceEnv("TLS_MODE", ""); tlsMode == "true" {
+		// The init container that runs this bootstrap does not mount the TLS secret, so it
+		// cannot open a TLS connection to a peer.
+		log.Printf("Sentinel TLS is enabled: skipping the peer master lookup, writing placeholder master %s", placeholderMasterHost)
+		return placeholderMasterHost, port
+	}
+	sentinelPort, _ := util.CoalesceEnv("SENTINEL_PORT", "26379")
+	password, _ := util.CoalesceEnv("REDIS_PASSWORD", "")
+	master, err := discoverPeerMaster(masterGroupName, sentinelPort, password, allowHostname)
+	if err != nil {
+		log.Printf("Warning: peer sentinels did not report a usable master (%v), writing placeholder master %s until the operator sets it", err, placeholderMasterHost)
+		return placeholderMasterHost, port
+	}
+	log.Printf("Bootstrapping sentinel monitor from peer sentinels: master %s (config epoch %d)", master.address(), master.configEpoch)
+	return master.host, master.port
 }
