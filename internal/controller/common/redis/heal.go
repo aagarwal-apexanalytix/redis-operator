@@ -244,7 +244,7 @@ func (h *healer) SentinelSet(ctx context.Context, rs *rsvb2.RedisSentinel, maste
 		return err
 	}
 	for _, pod := range pods.Items {
-		connInfo := createConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace, "26379")
+		connInfo := sentinelConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace)
 
 		for k, v := range map[string]string{
 			"down-after-milliseconds": rs.Spec.RedisSentinelConfig.DownAfterMilliseconds,
@@ -276,7 +276,7 @@ func (h *healer) SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel) err
 	}
 
 	for _, pod := range pods.Items {
-		connInfo := createConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace, "26379")
+		connInfo := sentinelConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace)
 
 		err = h.redis.Connect(connInfo).SentinelReset(ctx, rs.Spec.RedisSentinelConfig.MasterGroupName)
 		if err != nil {
@@ -310,7 +310,7 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 	}
 
 	for _, pod := range pods.Items {
-		connInfo := createConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace, "26379")
+		connInfo := sentinelConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace)
 
 		masterConnInfo := &redis.ConnectionInfo{
 			Host:     master,
@@ -437,6 +437,20 @@ func newTLSConfigVerifyingChainWithoutHostname(cert tls.Certificate, rootCAs *x5
 			return err
 		},
 	}
+}
+
+// sentinelConnectionInfo is createConnectionInfo for a sentinel pod, except that it always
+// dials the pod IP. Under TLS, createConnectionInfo dials the pod's headless-service FQDN, and
+// cluster DNS publishes that name only while the pod is Ready. A sentinel that the
+// master-aware readiness probe holds unready would then be unreachable by the very
+// SENTINEL MONITOR that makes it ready. Dialing the IP keeps the same verification:
+// newTLSConfigVerifyingChainWithoutHostname checks the certificate chain and never the name.
+func sentinelConnectionInfo(ctx context.Context, pod v1.Pod, password string, tlsConfig *commonapi.TLSConfig, k8sClient kubernetes.Interface, namespace string) *redis.ConnectionInfo {
+	connInfo := createConnectionInfo(ctx, pod, password, tlsConfig, k8sClient, namespace, "26379")
+	if pod.Status.PodIP != "" {
+		connInfo.Host = pod.Status.PodIP
+	}
+	return connInfo
 }
 
 // createConnectionInfo creates a Redis connection info with TLS support
