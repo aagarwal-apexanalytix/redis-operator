@@ -205,6 +205,10 @@ func generateRedisSentinelContainerParams(ctx context.Context, client kubernetes
 	if cr.Spec.TLS != nil {
 		containerProp.TLSConfig = cr.Spec.TLS
 	}
+	// Only the operator replaces a bootstrap placeholder master (reconcileSentinel's
+	// SENTINEL MONITOR), and it does so only when RedisSentinelConfig names the replication.
+	// Without it, a readiness probe that waits for a real master could wait forever.
+	containerProp.SentinelReadinessRequiresMaster = cr.Spec.RedisSentinelConfig != nil
 
 	return containerProp, nil
 }
