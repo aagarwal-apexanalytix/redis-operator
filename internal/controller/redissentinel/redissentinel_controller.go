@@ -2,6 +2,7 @@ package redissentinel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -24,6 +25,10 @@ import (
 
 const (
 	RedisSentinelFinalizer = "redisSentinelFinalizer"
+
+	// sentinelResyncInterval is how often a healthy RedisSentinel is reconciled again, so a
+	// sentinel left on a moved master is re-pointed without waiting for a CR event.
+	sentinelResyncInterval = time.Minute
 )
 
 // RedisSentinelReconciler reconciles a RedisSentinel object
@@ -122,9 +127,9 @@ func (r *RedisSentinelReconciler) reconcileReplication(ctx context.Context, inst
 // never assigns realMasterPod) — exactly the state during a split-brain. Formatting that empty pod
 // produced "..<ns>.svc.<domain>": both the pod name AND the headless-service name are empty, since
 // GetHeadlessServiceNameFromPodName("") == "". SENTINEL MONITOR rejects that with
-// "ERR Invalid IP address or hostname specified", and because the error aborts reconcileSentinel
-// BEFORE SentinelSet and SentinelReset run, the sentinel topology is never repaired and the error
-// repeats every reconcile — observed live as sentinel_masters:0 on one sentinel and num-slaves:0
+// "ERR Invalid IP address or hostname specified", and because that error aborted reconcileSentinel
+// BEFORE SentinelSet and SentinelReset ran, the sentinel topology was never repaired and the error
+// repeated every reconcile — observed live as sentinel_masters:0 on one sentinel and num-slaves:0
 // on the others, with the split-brain persisting indefinitely.
 //
 // Returning ok=false keeps the malformed address unconstructible rather than relying on every
@@ -175,16 +180,43 @@ func (r *RedisSentinelReconciler) reconcileSentinel(ctx context.Context, instanc
 			return intctrlutil.RequeueAfter(ctx, time.Second*30, "")
 		}
 	}
-	if err := r.Healer.SentinelMonitor(ctx, instance, monitorAddr); err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
+	// Every step runs on every sentinel even when one of them fails: a sentinel that cannot be
+	// reached must not leave the reachable ones on a master that has moved.
+	//
+	// A pass in which only some sentinels failed is not returned as an error. An error makes
+	// controller-runtime ignore RequeueAfter and back off exponentially (up to ~16 minutes), and
+	// one crash-looping sentinel would then hold every other one on a moved master for that
+	// long. Those failures are logged and the pass is repeated on the normal interval. An API
+	// failure, or a pass in which every sentinel failed, is returned as an error.
+	var fatal, partial []error
+	classify := func(step string, err error) {
+		if err == nil {
+			return
+		}
+		err = fmt.Errorf("sentinel %s: %w", step, err)
+		var podsErr *redis.SentinelPodsError
+		if errors.As(err, &podsErr) && !podsErr.AllFailed() {
+			partial = append(partial, err)
+			return
+		}
+		fatal = append(fatal, err)
 	}
-	if err := r.Healer.SentinelSet(ctx, instance, monitorAddr); err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
+	classify("monitor", r.Healer.SentinelMonitor(ctx, instance, monitorAddr))
+	classify("set", r.Healer.SentinelSet(ctx, instance, monitorAddr))
+	classify("reset", r.Healer.SentinelReset(ctx, instance))
+	if len(fatal) > 0 {
+		return intctrlutil.RequeueE(ctx, errors.Join(append(fatal, partial...)...), "")
 	}
-	if err := r.Healer.SentinelReset(ctx, instance); err != nil {
-		return intctrlutil.RequeueE(ctx, err, "")
+	if len(partial) > 0 {
+		log.FromContext(ctx).Error(errors.Join(partial...), "some sentinels could not be configured, retrying on the next pass",
+			"retryAfter", sentinelResyncInterval.String())
 	}
-	return intctrlutil.Reconciled()
+	// Sentinel stores the master as an IP. When the master pod moves without a CR or
+	// StatefulSet event, nothing else would requeue this reconcile, and a sentinel left on the
+	// old IP would stay there. A healthy sentinel gets only reads on a repeat pass: MONITOR and
+	// SET are skipped when it already holds the master and the values, and RESET runs only on a
+	// sentinel listing an address no pod has.
+	return intctrlutil.RequeueAfter(ctx, sentinelResyncInterval, "")
 }
 
 func (r *RedisSentinelReconciler) reconcilePDB(ctx context.Context, instance *rsvb2.RedisSentinel) (ctrl.Result, error) {

@@ -652,6 +652,10 @@ func (f *fakeRedisService) SentinelReset(context.Context, string) error {
 	return nil
 }
 
+func (f *fakeRedisService) SentinelPeers(context.Context, string) (*redisservice.SentinelPeersResult, error) {
+	return &redisservice.SentinelPeersResult{}, nil
+}
+
 func (f *fakeRedisService) GetInfoSentinel(context.Context) (*redisservice.InfoSentinelResult, error) {
 	return &redisservice.InfoSentinelResult{}, nil
 }

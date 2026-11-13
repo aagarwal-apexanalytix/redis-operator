@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OT-CONTAINER-KIT/redis-operator/internal/util"
 	rediscli "github.com/redis/go-redis/v9"
 )
 
@@ -35,6 +36,7 @@ var (
 	errNoPeers         = errors.New("no peer sentinel address resolved")
 	errNoUsableAnswer  = errors.New("no peer sentinel reported a usable master")
 	errAmbiguousAnswer = errors.New("peer sentinels disagree on the master at the same config epoch")
+	errNotMaster       = errors.New("reported master does not answer as a master")
 )
 
 // monitoredMaster is one peer sentinel's view of the master it monitors.
@@ -63,6 +65,10 @@ type peerLookup struct {
 	allowHostname bool
 	resolve       func(ctx context.Context, host string) ([]string, error)
 	query         func(ctx context.Context, addr string) (monitoredMaster, error)
+	// verify, when set, confirms that a peer-reported master answers as a master. A peer can
+	// still report a master that has gone (a pod moved to a new IP, its old address now dead
+	// or reused), and booting on it would leave this sentinel following nothing.
+	verify func(ctx context.Context, addr string) error
 }
 
 // discover returns the master the peer sentinels agree on. Answers that are unusable (the
@@ -103,10 +109,37 @@ func (l peerLookup) discover(ctx context.Context) (monitoredMaster, error) {
 		}
 		answers = append(answers, m)
 	}
+	if l.verify != nil {
+		answers, failures = l.liveMasters(ctx, answers, failures)
+	}
 	if len(answers) == 0 {
 		return monitoredMaster{}, fmt.Errorf("%w (%s)", errNoUsableAnswer, strings.Join(failures, "; "))
 	}
 	return pickMaster(answers)
+}
+
+// liveMasters keeps the answers whose master answers as a master. Each distinct address is
+// asked once. A dead master is dropped before the epoch vote, so a live master reported at a
+// lower epoch wins over a dead one reported at a higher epoch, and when no reported master is
+// live the caller falls back to the placeholder and the operator sets the master.
+func (l peerLookup) liveMasters(ctx context.Context, answers []monitoredMaster, failures []string) ([]monitoredMaster, []string) {
+	verdicts := map[string]error{}
+	var live []monitoredMaster
+	for _, a := range answers {
+		addr := a.address()
+		err, asked := verdicts[addr]
+		if !asked {
+			err = l.verify(ctx, addr)
+			verdicts[addr] = err
+			if err != nil {
+				failures = append(failures, fmt.Sprintf("master %s: %v", addr, err))
+			}
+		}
+		if err == nil {
+			live = append(live, a)
+		}
+	}
+	return live, failures
 }
 
 func (l peerLookup) usable(m monitoredMaster) bool {
@@ -192,6 +225,36 @@ func querySentinelMaster(password, masterGroup string, timeout time.Duration) fu
 	}
 }
 
+// queryMasterRole returns a check that asks a reported master `ROLE` and accepts it only when it
+// answers "master".
+func queryMasterRole(password string, timeout time.Duration) func(context.Context, string) error {
+	return func(ctx context.Context, addr string) error {
+		client := rediscli.NewClient(&rediscli.Options{
+			Addr:            addr,
+			Password:        password,
+			DialTimeout:     timeout,
+			ReadTimeout:     timeout,
+			WriteTimeout:    timeout,
+			MaxRetries:      -1,
+			Protocol:        2,
+			DisableIdentity: true,
+		})
+		defer client.Close()
+
+		reply, err := client.Do(ctx, "ROLE").Slice()
+		if err != nil {
+			return err
+		}
+		if len(reply) == 0 {
+			return fmt.Errorf("%w: empty ROLE reply", errNotMaster)
+		}
+		if role, _ := reply[0].(string); role != "master" {
+			return fmt.Errorf("%w: ROLE is %v", errNotMaster, reply[0])
+		}
+		return nil
+	}
+}
+
 // discoverPeerMaster is the production lookup GenerateConfig uses. It is a variable so the
 // config tests can replace it without a network.
 var discoverPeerMaster = func(masterGroup, sentinelPort, password string, allowHostname bool) (monitoredMaster, error) {
@@ -199,6 +262,9 @@ var discoverPeerMaster = func(masterGroup, sentinelPort, password string, allowH
 	if err != nil {
 		return monitoredMaster{}, fmt.Errorf("%w: %v", errNoPeerService, err)
 	}
+	// The master is asked with the replication password, the one Sentinel itself uses
+	// (`sentinel auth-pass`).
+	masterPassword, _ := util.CoalesceEnv("MASTER_PASSWORD", "")
 	ctx, cancel := context.WithTimeout(context.Background(), peerLookupBudget)
 	defer cancel()
 	return peerLookup{
@@ -207,5 +273,6 @@ var discoverPeerMaster = func(masterGroup, sentinelPort, password string, allowH
 		allowHostname: allowHostname,
 		resolve:       net.DefaultResolver.LookupHost,
 		query:         querySentinelMaster(password, masterGroup, peerQueryTimeout),
+		verify:        queryMasterRole(masterPassword, peerQueryTimeout),
 	}.discover(ctx)
 }

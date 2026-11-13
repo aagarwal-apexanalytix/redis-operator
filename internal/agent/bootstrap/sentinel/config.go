@@ -160,9 +160,10 @@ func GenerateConfig() error {
 
 // bootstrapMonitorAddress picks the master for the `sentinel monitor` line when the IP env
 // gives none. It asks the peer sentinels first, so a sentinel restarted while its peers are
-// healthy boots on the master they already follow and never advertises the placeholder. When
-// no peer can answer (the first sentinel of a new deployment, every sentinel restarted at
-// once, TLS, or a lookup failure) it returns the placeholder, and the operator's next
+// healthy boots on the master they already follow, once that master answers ROLE as a master,
+// and never advertises the placeholder. When no peer can answer, or no master it reports is
+// live (the first sentinel of a new deployment, every sentinel restarted at once, TLS, a
+// master that has moved, or a lookup failure), it returns the placeholder, and the operator's next
 // SENTINEL MONITOR sets the real master, as it always has.
 func bootstrapMonitorAddress(masterGroupName, port string, allowHostname bool) (string, string) {
 	if tlsMode, _ := util.CoalesceEnv("TLS_MODE", ""); tlsMode == "true" {

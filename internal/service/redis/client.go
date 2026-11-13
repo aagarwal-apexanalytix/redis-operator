@@ -3,15 +3,25 @@ package redis
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	rediscli "github.com/redis/go-redis/v9"
 )
 
+// ErrMonitorTargetUnresolved means a hostname SENTINEL MONITOR target did not resolve, so
+// whether a sentinel reporting an IP is stale could not be decided and it was left alone.
+var ErrMonitorTargetUnresolved = errors.New("sentinel monitor target does not resolve")
+
 const (
 	redisRoleMaster = "role:master"
+
+	// resolveTimeout bounds one DNS lookup of a SENTINEL MONITOR target.
+	resolveTimeout = 2 * time.Second
 )
 
 type ConnectionInfo struct {
@@ -22,6 +32,11 @@ type ConnectionInfo struct {
 	Password string
 	// TLSConfig configuration, nil means TLS is disabled
 	TLSConfig *tls.Config
+	// Resolve, when set, returns the current IPs of a hostname Host. A SENTINEL MONITOR target
+	// calls it only when a sentinel reports the master as an IP, so a caller can resolve once per
+	// pass and not at all when every sentinel reports the hostname. When nil, the hostname is
+	// resolved per call.
+	Resolve func(ctx context.Context) ([]string, error)
 }
 
 // ClusterStatus cluster status information, including the number of assigned slots
@@ -57,6 +72,8 @@ type Service interface {
 	SentinelSet(ctx context.Context, masterGroupName, key, value string) error
 	SentinelReset(ctx context.Context, masterGroupName string) error
 	GetInfoSentinel(ctx context.Context) (*InfoSentinelResult, error)
+	// SentinelPeers returns the replicas and other sentinels a sentinel knows for a master group.
+	SentinelPeers(ctx context.Context, masterGroupName string) (*SentinelPeersResult, error)
 	GetClusterInfo(ctx context.Context) (*ClusterStatus, error)
 }
 
@@ -70,6 +87,18 @@ type SentinelMasterInfo struct {
 	Address   string
 	Slaves    int
 	Sentinels int
+}
+
+// SentinelPeer is one replica or sentinel entry of SENTINEL REPLICAS / SENTINEL SENTINELS.
+type SentinelPeer struct {
+	IP    string
+	Port  string
+	Flags string
+}
+
+type SentinelPeersResult struct {
+	Replicas  []SentinelPeer
+	Sentinels []SentinelPeer
 }
 
 type service struct {
@@ -159,6 +188,14 @@ func (c *service) SentinelSet(ctx context.Context, masterGroupName, key, value s
 	}
 	defer client.Close()
 
+	// Every SENTINEL SET rewrites the sentinel's config file, and the reconcile repeats on a
+	// timer, so a value the sentinel already holds is not sent again.
+	if current, err := client.Do(ctx, "SENTINEL", "MASTER", masterGroupName).Result(); err == nil {
+		if have, ok := sentinelFields(current)[key]; ok && have == value {
+			return nil
+		}
+	}
+
 	cmd := rediscli.NewStringCmd(ctx, "SENTINEL", "SET", masterGroupName, key, value)
 	err := client.Process(ctx, cmd)
 	if err != nil {
@@ -201,36 +238,18 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 	defer client.Close()
 
 	masterExists := false
-	masterCheckCmd := rediscli.NewSliceCmd(ctx, "SENTINEL", "MASTER", masterGroupName)
-	if err = client.Process(ctx, masterCheckCmd); err == nil {
-		if err = masterCheckCmd.Err(); err == nil {
-			masterExists = true
-			result, _ := masterCheckCmd.Result()
-			var monitoredHost, monitoredPort string
-			for i := 0; i+1 < len(result); i += 2 {
-				key, ok := result[i].(string)
-				if !ok {
-					continue
-				}
-				var val string
-				switch v := result[i+1].(type) {
-				case string:
-					val = v
-				case []byte:
-					val = string(v)
-				default:
-					continue
-				}
-				switch key {
-				case "ip":
-					monitoredHost = val
-				case "port":
-					monitoredPort = val
-				}
-			}
-			if monitoredHost == master.Host && monitoredPort == master.Port {
-				return nil
-			}
+	if current, err := client.Do(ctx, "SENTINEL", "MASTER", masterGroupName).Result(); err == nil {
+		masterExists = true
+		fields := sentinelFields(current)
+		same, err := monitorsTarget(ctx, fields["ip"], fields["port"], master)
+		if err != nil {
+			// The target cannot be resolved, so whether this sentinel is stale is unknown.
+			// SENTINEL MONITOR would fail on the same name, and the REMOVE before it would
+			// leave the sentinel monitoring nothing, so leave it as it is.
+			return err
+		}
+		if same {
+			return nil
 		}
 	}
 
@@ -269,6 +288,137 @@ func (c *service) SentinelMonitor(ctx context.Context, master *ConnectionInfo, m
 	}
 
 	return nil
+}
+
+// monitorsTarget reports whether a sentinel that reports its master at monitoredHost:monitoredPort
+// already monitors target.
+//
+// A hostname target has to be resolved first. With resolve-hostnames yes and announce-hostnames
+// no, Sentinel resolves the name once at MONITOR time and reports only the resulting IP, so a
+// plain string comparison never matches: every reconcile then removed and re-added the master,
+// discarding the sentinel's known replicas and sentinels and resetting its config epoch. Comparing
+// against the name's current addresses leaves a sentinel on the current master alone and still
+// re-points one left on the IP of a master pod that has since moved.
+func monitorsTarget(ctx context.Context, monitoredHost, monitoredPort string, target *ConnectionInfo) (bool, error) {
+	if monitoredPort != target.Port {
+		return false, nil
+	}
+	if monitoredHost == target.Host {
+		return true, nil
+	}
+	if net.ParseIP(target.Host) != nil {
+		return false, nil
+	}
+	monitoredIP := net.ParseIP(monitoredHost)
+	if monitoredIP == nil {
+		// Sentinel reports a different hostname (announce-hostnames yes): a different master.
+		return false, nil
+	}
+	resolve := target.Resolve
+	if resolve == nil {
+		resolve = func(ctx context.Context) ([]string, error) { return ResolveHost(ctx, target.Host) }
+	}
+	addrs, err := resolve(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, addr := range addrs {
+		if ip := net.ParseIP(addr); ip != nil && ip.Equal(monitoredIP) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// lookupHost is the resolver ResolveHost uses; a variable so tests can observe the name and
+// deadline it is given.
+var lookupHost = net.DefaultResolver.LookupHost
+
+// ResolveHost resolves a SENTINEL MONITOR target hostname to its current IPs, within
+// resolveTimeout. A fully qualified name gets a trailing dot so the resolver does not first try
+// it against every search domain.
+func ResolveHost(ctx context.Context, host string) ([]string, error) {
+	name := host
+	if strings.Contains(name, ".") && !strings.HasSuffix(name, ".") {
+		name += "."
+	}
+	ctx, cancel := context.WithTimeout(ctx, resolveTimeout)
+	defer cancel()
+	addrs, err := lookupHost(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", ErrMonitorTargetUnresolved, host, err)
+	}
+	return addrs, nil
+}
+
+func (c *service) SentinelPeers(ctx context.Context, masterGroupName string) (*SentinelPeersResult, error) {
+	client := c.createClient()
+	if client == nil {
+		return &SentinelPeersResult{}, nil
+	}
+	defer client.Close()
+
+	replicas, err := sentinelInstances(ctx, client, "REPLICAS", masterGroupName)
+	if err != nil {
+		return nil, err
+	}
+	sentinels, err := sentinelInstances(ctx, client, "SENTINELS", masterGroupName)
+	if err != nil {
+		return nil, err
+	}
+	return &SentinelPeersResult{Replicas: replicas, Sentinels: sentinels}, nil
+}
+
+func sentinelInstances(ctx context.Context, client *rediscli.Client, sub, masterGroupName string) ([]SentinelPeer, error) {
+	items, err := client.Do(ctx, "SENTINEL", sub, masterGroupName).Slice()
+	if err != nil {
+		return nil, err
+	}
+	peers := make([]SentinelPeer, 0, len(items))
+	for _, item := range items {
+		f := sentinelFields(item)
+		peers = append(peers, SentinelPeer{IP: f["ip"], Port: f["port"], Flags: f["flags"]})
+	}
+	return peers, nil
+}
+
+// sentinelFields turns one sentinel instance reply (SENTINEL MASTER, or one element of
+// SENTINEL REPLICAS / SENTINELS) into its fields. Sentinel sends a flat key/value array under
+// RESP2 and a map under RESP3; a slice command reads only half of a RESP3 map and leaves the rest
+// on the connection, so these replies are read generically and both shapes are accepted.
+func sentinelFields(reply interface{}) map[string]string {
+	fields := map[string]string{}
+	switch v := reply.(type) {
+	case []interface{}:
+		for i := 0; i+1 < len(v); i += 2 {
+			key, kok := sentinelString(v[i])
+			val, vok := sentinelString(v[i+1])
+			if kok && vok {
+				fields[key] = val
+			}
+		}
+	case map[interface{}]interface{}:
+		for k, val := range v {
+			key, kok := sentinelString(k)
+			str, vok := sentinelString(val)
+			if kok && vok {
+				fields[key] = str
+			}
+		}
+	}
+	return fields
+}
+
+func sentinelString(v interface{}) (string, bool) {
+	switch s := v.(type) {
+	case string:
+		return s, true
+	case []byte:
+		return string(s), true
+	case int64:
+		return strconv.FormatInt(s, 10), true
+	}
+	return "", false
 }
 
 func (c *service) IsMaster(ctx context.Context) (bool, error) {
