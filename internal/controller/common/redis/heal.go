@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strings"
 
 	commonapi "github.com/OT-CONTAINER-KIT/redis-operator/api/common/v1beta2"
@@ -51,6 +52,8 @@ type Healer interface {
 type healer struct {
 	redis redis.Client
 	k8s   kubernetes.Interface
+	// resolveHost resolves a hostname master; nil means redis.ResolveHost.
+	resolveHost func(ctx context.Context, host string) ([]string, error)
 }
 
 func NewHealer(clientset kubernetes.Interface) Healer {
@@ -234,6 +237,30 @@ func isConnectivityError(err error) bool {
 		errors.Is(err, os.ErrDeadlineExceeded)
 }
 
+// SentinelPodsError reports the sentinels a healer pass could not configure. Each sentinel is
+// tried even when another fails; Total is how many sentinels the pass tried.
+type SentinelPodsError struct {
+	Failed int
+	Total  int
+	Errs   []error
+}
+
+func (e *SentinelPodsError) Error() string {
+	return fmt.Sprintf("%d of %d sentinels failed: %v", e.Failed, e.Total, errors.Join(e.Errs...))
+}
+
+func (e *SentinelPodsError) Unwrap() []error { return e.Errs }
+
+// AllFailed reports whether no sentinel the pass tried could be configured.
+func (e *SentinelPodsError) AllFailed() bool { return e.Failed >= e.Total }
+
+func sentinelPodsError(errs []error, total int) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	return &SentinelPodsError{Failed: len(errs), Total: total, Errs: errs}
+}
+
 func (h *healer) SentinelSet(ctx context.Context, rs *rsvb2.RedisSentinel, master string) error {
 	pods, err := h.getSentinelPods(ctx, rs)
 	if err != nil {
@@ -243,7 +270,16 @@ func (h *healer) SentinelSet(ctx context.Context, rs *rsvb2.RedisSentinel, maste
 	if err != nil {
 		return err
 	}
+	var errs []error
+	tried := 0
 	for _, pod := range pods.Items {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(append(errs, ctxErr)...)
+		}
+		if !isSentinelPodDialable(&pod) {
+			continue
+		}
+		tried++
 		connInfo := sentinelConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace)
 
 		for k, v := range map[string]string{
@@ -256,14 +292,24 @@ func (h *healer) SentinelSet(ctx context.Context, rs *rsvb2.RedisSentinel, maste
 			}
 			err = h.redis.Connect(connInfo).SentinelSet(ctx, rs.Spec.RedisSentinelConfig.MasterGroupName, k, v)
 			if err != nil {
-				return err
+				errs = append(errs, sentinelPodError(pod, err))
+				break
 			}
 		}
 	}
-	return nil
+	return sentinelPodsError(errs, tried)
 }
 
-// SentinelReset range all sentinel execute `sentinel reset *`
+// SentinelReset executes `SENTINEL RESET <group>` on a sentinel that still lists a replica or a
+// sentinel at an address none of this deployment's pods has any more and that it flags s_down
+// or disconnected: the entries a pod leaves behind when it moves to a new IP or is scaled away,
+// which only SENTINEL RESET purges. Staleness is decided by address (by pod name for an entry
+// announced as a hostname), never by count, so extra legitimate sentinels watching the same
+// group (another RedisSentinel, or an embedded one) do not trigger it while they are up.
+//
+// At most one sentinel is reset per pass. A reset discards the sentinel's peers and aborts a
+// failover in progress, so sentinels are reset one at a time with time between them to
+// rediscover each other; the periodic reconcile resets the next one.
 func (h *healer) SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel) error {
 	pods, err := h.getSentinelPods(ctx, rs)
 	if err != nil {
@@ -275,18 +321,118 @@ func (h *healer) SentinelReset(ctx context.Context, rs *rsvb2.RedisSentinel) err
 		return err
 	}
 
-	for _, pod := range pods.Items {
-		connInfo := sentinelConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace)
+	live, err := h.livePods(ctx, rs, pods)
+	if err != nil {
+		return err
+	}
 
-		err = h.redis.Connect(connInfo).SentinelReset(ctx, rs.Spec.RedisSentinelConfig.MasterGroupName)
+	group := rs.Spec.RedisSentinelConfig.MasterGroupName
+	var errs []error
+	tried := 0
+	for _, pod := range pods.Items {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(append(errs, ctxErr)...)
+		}
+		if !isSentinelPodDialable(&pod) {
+			continue
+		}
+		tried++
+		connInfo := sentinelConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace)
+		redisService := h.redis.Connect(connInfo)
+
+		peers, err := redisService.SentinelPeers(ctx, group)
 		if err != nil {
-			return err
+			errs = append(errs, sentinelPodError(pod, err))
+			continue
+		}
+		stale := staleSentinelPeers(peers, live)
+		if len(stale) == 0 {
+			continue
+		}
+		log.FromContext(ctx).Info("resetting sentinel that lists entries no pod has any more", "pod", pod.Name, "stale", stale)
+		if err := redisService.SentinelReset(ctx, group); err != nil {
+			errs = append(errs, sentinelPodError(pod, err))
+			continue
+		}
+		break
+	}
+	return sentinelPodsError(errs, tried)
+}
+
+// livePodSet is the IPs and names of the Running or Pending pods of one sentinel deployment:
+// its sentinel pods and its replication's pods.
+type livePodSet struct {
+	ips   map[string]bool
+	names map[string]bool
+}
+
+func (l *livePodSet) add(pods []v1.Pod) {
+	for i := range pods {
+		pod := &pods[i]
+		if !isPodRunningOrPending(pod) {
+			continue
+		}
+		l.names[pod.Name] = true
+		if pod.Status.PodIP != "" {
+			l.ips[pod.Status.PodIP] = true
+		}
+		for _, ip := range pod.Status.PodIPs {
+			l.ips[ip.IP] = true
 		}
 	}
-	return nil
+}
+
+// livePods collects the sentinel pods already listed and the replication's pods, each through
+// its StatefulSet's label selector rather than every pod in the namespace. A replication that
+// is not found contributes no pods.
+func (h *healer) livePods(ctx context.Context, rs *rsvb2.RedisSentinel, sentinelPods *v1.PodList) (*livePodSet, error) {
+	live := &livePodSet{ips: map[string]bool{}, names: map[string]bool{}}
+	live.add(sentinelPods.Items)
+	if name := rs.Spec.RedisSentinelConfig.RedisReplicationName; name != "" {
+		replicationPods, err := h.podsOfStatefulSet(ctx, rs.Namespace, name)
+		switch {
+		case apierrors.IsNotFound(err):
+		case err != nil:
+			return nil, err
+		default:
+			live.add(replicationPods.Items)
+		}
+	}
+	return live, nil
+}
+
+// staleSentinelPeers returns the entries a sentinel flags s_down or disconnected that belong to
+// no live pod: an IP entry whose IP no live pod has, or a hostname entry (announce-hostnames
+// yes) whose first DNS label, the pod name, no live pod has.
+func staleSentinelPeers(peers *redis.SentinelPeersResult, live *livePodSet) []string {
+	if peers == nil {
+		return nil
+	}
+	var stale []string
+	for _, p := range append(append([]redis.SentinelPeer{}, peers.Replicas...), peers.Sentinels...) {
+		if p.IP == "" {
+			continue
+		}
+		if ip := net.ParseIP(p.IP); ip != nil {
+			if live.ips[ip.String()] || live.ips[p.IP] {
+				continue
+			}
+		} else if podName, _, _ := strings.Cut(p.IP, "."); live.names[podName] {
+			continue
+		}
+		flags := strings.Split(p.Flags, ",")
+		if slices.Contains(flags, "s_down") || slices.Contains(flags, "disconnected") {
+			stale = append(stale, net.JoinHostPort(p.IP, p.Port))
+		}
+	}
+	return stale
 }
 
 // SentinelMonitor range all sentinel execute `sentinel monitor`
+//
+// A sentinel that fails is recorded and the loop moves on: stopping at the first error left
+// every sentinel after it on the old master until something changed the CR again. A hostname
+// master is resolved once for the whole pass.
 func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, master string) error {
 	pods, err := h.getSentinelPods(ctx, rs)
 	if err != nil {
@@ -309,13 +455,26 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 		}
 	}
 
+	resolve := h.masterResolver(master)
+
+	var errs []error
+	var unresolved error
+	tried := 0
 	for _, pod := range pods.Items {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(append(errs, ctxErr)...)
+		}
+		if !isSentinelPodDialable(&pod) {
+			continue
+		}
+		tried++
 		connInfo := sentinelConnectionInfo(ctx, pod, sentinelPass, rs.Spec.TLS, h.k8s, rs.Namespace)
 
 		masterConnInfo := &redis.ConnectionInfo{
 			Host:     master,
 			Port:     "6379",
 			Password: masterPass,
+			Resolve:  resolve,
 		}
 		err = h.redis.Connect(connInfo).SentinelMonitor(
 			ctx,
@@ -323,25 +482,86 @@ func (h *healer) SentinelMonitor(ctx context.Context, rs *rsvb2.RedisSentinel, m
 			rs.Spec.RedisSentinelConfig.MasterGroupName,
 			rs.Spec.RedisSentinelConfig.Quorum,
 		)
-		if err != nil {
-			return err
+		switch {
+		case errors.Is(err, redis.ErrMonitorTargetUnresolved):
+			// The sentinel was left as it is; the next pass retries. Not a sentinel failure.
+			unresolved = err
+		case err != nil:
+			errs = append(errs, sentinelPodError(pod, err))
 		}
 	}
+	if unresolved != nil {
+		log.FromContext(ctx).Info("master hostname does not resolve yet, sentinels that report an IP were left as they are this pass",
+			"master", master, "error", unresolved.Error())
+	}
 
-	return nil
+	return sentinelPodsError(errs, tried)
+}
+
+// masterResolver returns the Resolve callback for a hostname master: it looks the name up the
+// first time a sentinel reports the master as an IP and reuses that answer, or that failure,
+// for the rest of the pass. While the master pod is not ready its headless name may not resolve
+// at all, and a pass whose sentinels all report the hostname needs no lookup. An IP master gets
+// no callback.
+func (h *healer) masterResolver(master string) func(ctx context.Context) ([]string, error) {
+	if net.ParseIP(master) != nil {
+		return nil
+	}
+	lookup := h.resolveHost
+	if lookup == nil {
+		lookup = redis.ResolveHost
+	}
+	var (
+		done  bool
+		addrs []string
+		err   error
+	)
+	return func(ctx context.Context) ([]string, error) {
+		if !done {
+			done = true
+			if addrs, err = lookup(ctx, master); err != nil && !errors.Is(err, redis.ErrMonitorTargetUnresolved) {
+				err = fmt.Errorf("%w: %s: %w", redis.ErrMonitorTargetUnresolved, master, err)
+			}
+		}
+		return addrs, err
+	}
+}
+
+// isSentinelPodDialable reports whether a sentinel pod can be configured at all. A pod with no
+// IP yet would be dialed at ":26379", the operator's own loopback; a Pending pod is still in its
+// init containers and is not listening; a terminating pod is about to be replaced; an evicted or
+// completed pod keeps its PodIP but runs nothing. Readiness is deliberately not required: the
+// sentinel readiness probe holds a sentinel unready until SENTINEL MONITOR gives it a real master.
+func isSentinelPodDialable(pod *v1.Pod) bool {
+	return pod.Status.PodIP != "" && pod.DeletionTimestamp == nil && pod.Status.Phase == v1.PodRunning
+}
+
+func isPodRunningOrPending(pod *v1.Pod) bool {
+	return pod.Status.Phase == v1.PodRunning || pod.Status.Phase == v1.PodPending
+}
+
+func sentinelPodError(pod v1.Pod, err error) error {
+	return fmt.Errorf("sentinel %s: %w", pod.Name, err)
 }
 
 func (h *healer) getSentinelPods(ctx context.Context, rs *rsvb2.RedisSentinel) (*v1.PodList, error) {
-	sentinelSTS, err := h.k8s.AppsV1().StatefulSets(rs.Namespace).Get(ctx, rs.GetStatefulSetName(), metav1.GetOptions{})
+	return h.podsOfStatefulSet(ctx, rs.Namespace, rs.GetStatefulSetName())
+}
+
+// podsOfStatefulSet lists the pods matching a StatefulSet's selector.
+func (h *healer) podsOfStatefulSet(ctx context.Context, namespace, name string) (*v1.PodList, error) {
+	sts, err := h.k8s.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	var labels []string
-	for k, v := range sentinelSTS.Spec.Selector.MatchLabels {
-		labels = append(labels, fmt.Sprintf("%s=%s", k, v))
+	if sts.Spec.Selector != nil {
+		for k, v := range sts.Spec.Selector.MatchLabels {
+			labels = append(labels, fmt.Sprintf("%s=%s", k, v))
+		}
 	}
-	pods, err := h.k8s.CoreV1().Pods(rs.Namespace).List(ctx, metav1.ListOptions{
+	pods, err := h.k8s.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: strings.Join(labels, ","),
 	})
 	if err != nil {

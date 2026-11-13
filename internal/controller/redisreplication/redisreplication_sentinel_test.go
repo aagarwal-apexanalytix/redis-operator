@@ -320,6 +320,10 @@ func (f *fakeSentinelRedisService) SentinelSet(context.Context, string, string, 
 
 func (f *fakeSentinelRedisService) SentinelReset(context.Context, string) error { return nil }
 
+func (f *fakeSentinelRedisService) SentinelPeers(context.Context, string) (*redis.SentinelPeersResult, error) {
+	return &redis.SentinelPeersResult{}, nil
+}
+
 func (f *fakeSentinelRedisService) GetInfoSentinel(context.Context) (*redis.InfoSentinelResult, error) {
 	return &redis.InfoSentinelResult{
 		Masters: []redis.SentinelMasterInfo{
